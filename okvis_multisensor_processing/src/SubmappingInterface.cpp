@@ -1315,6 +1315,13 @@ namespace okvis {
                 }
               }
 
+              // Also for color/gray images.
+              if(depthImageResDownsamplingRatio_ > 1 && !measurement.measurement.image.empty()) {
+                cv::Mat imageSubsampled;
+                cv::resize(measurement.measurement.image, imageSubsampled, cv::Size(), 1.0 / depthImageResDownsamplingRatio_, 1.0 / depthImageResDownsamplingRatio_, cv::INTER_NEAREST);
+                measurement.measurement.image = imageSubsampled;
+              }
+
               posed_cam_idx_measurements.emplace_back(std::make_pair(Eigen::Isometry3f(T_WD.T().cast<float>()), measurement));
             }
 
