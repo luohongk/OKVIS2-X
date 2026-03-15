@@ -147,21 +147,42 @@ if(USE_NN)
   endif()
 
   if(USE_COLIDMAP)
-    # Get Models for FindAnything: Efficient SAM
-    set(ESAM_URL "https://cvg.cit.tum.de/webshare/g/srl-models/findanything/esam-model.pt")
-    set(ESAM_FILE "${PROJECT_SOURCE_DIR}/build/esam-model.pt")
-    set(ESAM_HASH "SHA256=dd76bfa171b70ea580be5361c04f936051f1be5780e57e369c310c8610c24d0f")
-    check_hash("${ESAM_FILE}" "${ESAM_HASH}" ESAM_OK)
-    if(ESAM_OK)
-      message(STATUS "ESAM Model already available. No Download needed!")
+    # Get Models for FindAnything: Efficient SAM (Original Model)
+    set(ESAM_ORIGINAL_URL "https://cvg.cit.tum.de/webshare/g/srl-models/findanything/esam-model-original.pt")
+    set(ESAM_ORIGINAL_FILE "${PROJECT_SOURCE_DIR}/build/esam-model-original.pt")
+    set(ESAM_ORIGINAL_HASH "SHA256=428d6c0409fffa6f9b5ce713ca635d22b2f4800817c1e4daed323d5c2e38735e")
+    check_hash("${ESAM_ORIGINAL_FILE}" "${ESAM_ORIGINAL_HASH}" ESAM_ORIGINAL_OK)
+    if(ESAM_ORIGINAL_OK)
+      message(STATUS "ESAM Model (Original) already available. No Download needed!")
     else()
       file(DOWNLOAD
-        ${ESAM_URL}
-        ${ESAM_FILE}
-        EXPECTED_HASH ${ESAM_HASH}
+        ${ESAM_ORIGINAL_URL}
+        ${ESAM_ORIGINAL_FILE}
+        EXPECTED_HASH ${ESAM_ORIGINAL_HASH}
         TIMEOUT 120
       )
     endif()
+
+    # Get Models for FindAnything: Efficient SAM (Fast Model)
+    set(ESAM_FAST_URL "https://cvg.cit.tum.de/webshare/g/srl-models/findanything/esam-model-fast.pt")
+    set(ESAM_FAST_FILE "${PROJECT_SOURCE_DIR}/build/esam-model-fast.pt")
+    set(ESAM_FAST_HASH "SHA256=dd76bfa171b70ea580be5361c04f936051f1be5780e57e369c310c8610c24d0f")
+    check_hash("${ESAM_FAST_FILE}" "${ESAM_FAST_HASH}" ESAM_FAST_OK)
+    if(ESAM_FAST_OK)
+      message(STATUS "ESAM Model (Fast) already available. No Download needed!")
+    else()
+      file(DOWNLOAD
+        ${ESAM_FAST_URL}
+        ${ESAM_FAST_FILE}
+        EXPECTED_HASH ${ESAM_FAST_HASH}
+        TIMEOUT 120
+      )
+    endif()
+
+    set(ESAM_FILE "${PROJECT_SOURCE_DIR}/build/esam-model.pt")
+
+    # Please set your desiered ESAM model (ESAM_ORIGINAL_FILE or ESAM_FAST_FILE) here.
+    file(RENAME ${ESAM_ORIGINAL_FILE} ${ESAM_FILE})
     if(BUILD_ROS2)
       file(COPY ${ESAM_FILE}
           DESTINATION ${PROJECT_SOURCE_DIR}/resources/)
