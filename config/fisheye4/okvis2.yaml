@@ -1,0 +1,133 @@
+%YAML:1.2
+# OKVis2 配置文件（由 get_data.py 自动生成）
+# 参考系：fisheye_cam0 (cam0)
+
+cameras:
+  # cam0 - 前 (front)
+  - {T_SC:
+       [0.25140885, -0.86281683, -0.43856664, -0.09141318,
+        0.86605994, -0.00176235,  0.49993706,  0.02909508,
+        -0.43212702, -0.50551361,  0.74680803,  0.24090597,
+        0.00000000,  0.00000000,  0.00000000,  1.00000000],
+     image_dimension: [1088, 1280],
+     distortion_coefficients: [-0.05761960, 0.00293563, -0.00663436, 0.00178434],
+     distortion_type: equidistant,
+     focal_length: [395.00109560, 394.77479164],
+     principal_point: [536.16176516, 673.65535871],
+     cam_model: pinhole,
+     camera_type: color,
+     mapping_rectification: true,
+     slam_use: okvis}
+
+  # cam1 - 右 (right)
+  - {T_SC:
+       [0.24708886,  0.86970528,  0.42727019,  0.05389273,
+        -0.86402426, -0.00185927,  0.50344674,  0.02918624,
+        0.43864470, -0.49356790,  0.75098706,  0.24036148,
+        0.00000000,  0.00000000,  0.00000000,  1.00000000],
+     image_dimension: [1088, 1280],
+     distortion_coefficients: [-0.05447515, -0.00458536, -0.00140688, 0.00070252],
+     distortion_type: equidistant,
+     focal_length: [393.55340406, 393.28715685],
+     principal_point: [542.22068531, 657.45037535],
+     cam_model: pinhole,
+     camera_type: color,
+     slam_use: okvis}
+
+  # cam2 - 后 (rear)
+  - {T_SC:
+       [0.42824471,  0.49872385, -0.75357879, -0.13353251,
+        0.86951014, -0.00031935,  0.49391498,  0.02683309,
+        0.24608653, -0.86676088, -0.43378220,  0.04775844,
+        0.00000000,  0.00000000,  0.00000000,  1.00000000],
+     image_dimension: [1088, 1280],
+     distortion_coefficients: [-0.05836169, 0.00078725, -0.00629457, 0.00239077],
+     distortion_type: equidistant,
+     focal_length: [395.45425338, 395.55379518],
+     principal_point: [545.85606066, 657.97980051],
+     cam_model: pinhole,
+     camera_type: color,
+     slam_use: okvis}
+
+  # cam3 - 左 (left)
+  - {T_SC:
+       [0.43757616, -0.50018259,  0.74722452,  0.09591673,
+        -0.86553778, -0.00911267,  0.50076074,  0.02686442,
+        -0.24366259, -0.86587201, -0.43691442,  0.04813807,
+        0.00000000,  0.00000000,  0.00000000,  1.00000000],
+     image_dimension: [1088, 1280],
+     distortion_coefficients: [-0.05621644, -0.00531785, -0.00006621, 0.00011840],
+     distortion_type: equidistant,
+     focal_length: [395.72395165, 395.26038161],
+     principal_point: [538.99676448, 641.45007258],
+     cam_model: pinhole,
+     camera_type: color,
+     slam_use: okvis}
+
+camera_parameters:
+  timestamp_tolerance: 0.020         # 放宽到20ms，容忍更大时间戳抖动
+  sync_cameras: [0, 1, 2, 3]
+  image_delay: 0.0
+  online_calibration:
+    do_extrinsics: true             # 🔧 诊断模式：先关闭，隔离是否外参在线漂移导致崩溃
+    do_extrinsics_final_ba: false
+    sigma_r: 0.005
+    sigma_alpha: 0.020
+    sigma_r_final_ba: 0.010
+    sigma_alpha_final_ba: 0.050
+  deep_stereo_indices: [0, 1]
+  fov_scale: 0.85
+
+imu_parameters:
+  use: true
+  rate: 200          # IMU采样频率(Hz)，请根据实际硬件修改！常见值：100/200/400
+  a_max: 117.6
+  g_max: 7.8         # 原值3.4(195°/s)太小，改为7.8(~450°/s)更安全
+  sigma_g_c: 20.0e-4
+  sigma_a_c: 2.0e-2
+  sigma_bg: 0.01
+  sigma_ba: 0.1
+  sigma_gw_c: 20.0e-5
+  sigma_aw_c: 20.0e-3
+  g: 9.81007
+  g0: [0.0, 0.0, 0.0]
+  a0: [0.0, 0.0, 0.0]
+  s_a: [1.0, 1.0, 1.0]
+  T_BS:
+    [1.00000000, 0.00000000, 0.00000000, 0.00000000,
+     0.00000000, 1.00000000, 0.00000000, 0.00000000,
+     0.00000000, 0.00000000, 1.00000000, 0.00000000,
+     0.00000000, 0.00000000, 0.00000000, 1.00000000]
+
+frontend_parameters:
+  detection_threshold: 15.0           # 进一步降低，提取更多特征点（原20，日志显示特征不足）
+  absolute_threshold: 12.0           # 配合降低
+  matching_threshold: 80.0           # 放宽匹配阈值（原60太严，RANSAC内点率只有14%）
+  octaves: 0
+  max_num_keypoints: 800            # 恢复1200（上次被改成500太少，跟踪直接弱）
+  keyframe_overlap: 0.50             # 降低阈值，更频繁插入关键帧（原0.70太高）
+  use_cnn: false
+  parallelise_detection: true
+  num_matching_threads: 4
+
+estimator_parameters:
+  num_keyframes: 5                   # 适中，太多(10)耗时导致实时超时跳过优化
+  num_loop_closure_frames: 5
+  num_imu_frames: 3
+  do_loop_closures: true
+  do_final_ba: true
+  enforce_realtime: true            # ⚠️ 关闭实时限制！跟踪已弱时不能强制跳过优化
+  realtime_min_iterations: 4
+  realtime_max_iterations: 15        # 允许更多迭代让优化收敛
+  realtime_time_limit: 0.08          # 放宽时间限制（原0.04=40ms太紧）
+  realtime_num_threads: 6
+  full_graph_iterations: 20
+  full_graph_num_threads: 2
+  p_dbow: 0.4
+  drift_percentage_heuristic: 2.50   # 放宽回环一致性检验（原1.35太严，导致所有回环被拒绝）
+
+output_parameters:
+  display_topview: true
+  display_matches: true
+  display_overhead: false
+  enable_submapping: true

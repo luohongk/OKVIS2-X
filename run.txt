@@ -1,0 +1,21 @@
+纯粹VIO
+
+export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH 
+
+./okvis_app_synchronous \
+      ../config/euroc/okvis2.yaml \
+      /home/lhk/data/cuvslam_data/MH_01_easy/mav0 \
+      /home/lhk/workspace/OKVIS2-X/output/euroc
+
+
+鱼眼相机VIO
+
+./okvis_app_synchronous ../config/fisheye4/okvis2.yaml /home/lhk/data/euroc_data/makecoffee /home/lhk/workspace/OKVIS2-X/output/mydata
+
+
+方式二：带密集建图（OKVIS2-X）（需要深度图像或立体深度网络）
+  cd /home/lhk/workspace/OKVIS2-X/build
+
+
+./okvis2x_app_synchronous ../config/euroc/okvis2.yaml ../config/euroc/se2.yaml /home/lhk/data/cuvslam_data/MH_01_easy/mav0 /home/lhk/workspace/OKVIS2-X/output/euroc
+

@@ -263,6 +263,7 @@ if(BUILD_APPS)
     ${OpenCV_LIBS}
     Boost::filesystem
     okvis::Frontend
+    curl tiff
   )
   target_compile_options(dbow2_test
     PUBLIC
@@ -281,6 +282,7 @@ if(BUILD_APPS)
     ${OpenCV_LIBS}
     Boost::filesystem
     okvis::MultisensorProcessing
+    curl tiff
   )
   target_compile_options(okvis_app_synchronous
     PUBLIC
@@ -309,6 +311,7 @@ if(BUILD_APPS)
           ${GeographicLib_LIBRARIES}
           SRL::Supereight2
           SRL::Projection
+          curl tiff
   )
   target_compile_options(okvis2x_app_synchronous
     PUBLIC
