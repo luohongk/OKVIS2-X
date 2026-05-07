@@ -29,6 +29,10 @@
 #include <okvis/timing/Timer.hpp>
 #include <thread>
 
+#ifdef OKVIS_USE_DL_FEATURES
+#include <okvis/dl_features/DLFeatureExtractor.hpp>
+#endif
+
 /// \brief okvis Main namespace of this package.
 namespace okvis {
 
@@ -421,8 +425,29 @@ private:
   /// at startup.
   void initialiseBriskFeatureDetectors();
 
+  /// \brief Initialise SuperPoint / LightGlue ORT sessions from FrontendParameters.
+  void initialiseDlFeatures(const okvis::ViParameters& params);
+
   /// \brief Classification network for keypoints (if enabled).
   std::vector<std::shared_ptr<Network>> networks_;
+
+#ifdef OKVIS_USE_DL_FEATURES
+  /// @name Deep-learning feature extraction / matching (SuperPoint + LightGlue)
+  /// @{
+
+  /// SuperPoint or DISK ONNX extractor (shared across cameras — single-threaded use).
+  std::unique_ptr<dl::DLFeatureExtractor> dlExtractor_;
+
+  /// LightGlue fused ONNX matcher.
+  std::unique_ptr<dl::DLFeatureMatcher>   dlMatcher_;
+
+  /// Mutex protecting dlExtractor_ / dlMatcher_ against concurrent camera threads.
+  std::mutex dlMutex_;
+
+  /// Whether the DL sessions have been initialised.
+  bool dlFeaturesInitialised_ = false;
+  /// @}
+#endif
 
   /**
    * @brief Match the frames to older, co-visible frames and triangulate.

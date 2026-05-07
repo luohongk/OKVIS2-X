@@ -1,0 +1,16 @@
+#IncludeRegexLine: ^[ 	]*[#%][ 	]*(include|import)[ 	]*[<"]([^">]+)([">])
+
+#IncludeRegexScan: ^.*$
+
+#IncludeRegexComplain: ^$
+
+#IncludeRegexTransform: 
+
+/home/lhk/workspace/DBow3_dpl/src/quicklz.c
+quicklz.h
+/home/lhk/workspace/DBow3_dpl/src/quicklz.h
+
+/home/lhk/workspace/DBow3_dpl/src/quicklz.h
+string.h
+-
+

@@ -21,6 +21,7 @@
 #define INCLUDE_OKVIS_PARAMETERS_HPP_
 
 #include <set>
+#include <string>
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Woverloaded-virtual"
 #include <opencv2/core.hpp>
@@ -117,6 +118,15 @@ struct FrontendParameters {
   bool use_cnn; ///< Use the CNN (if available) to filter out dynamic content / sky.
   bool parallelise_detection; ///< Run parallel detect & describe.
   int num_matching_threads; ///< Parallelise matching with this number of threads.
+
+  // Deep-learning feature parameters (SuperPoint + LightGlue)
+  bool use_dl_features = false;              ///< Enable DL-based feature extraction/matching.
+  std::string dl_extractor_type = "";        ///< DL extractor type, e.g. "superpoint" or "disk".
+  std::string dl_extractor_path = "";        ///< Path to the extractor ONNX model file.
+  std::string dl_matcher_path = "";          ///< Path to the LightGlue ONNX model file.
+  double dl_match_threshold = 0.7;            ///< Minimum confidence threshold for DL matches.
+  int dl_image_size = 512;                   ///< Image resize target (longest side) for DL models.
+  bool dl_use_gpu = false;                   ///< Run DL inference on GPU if true, CPU otherwise.
 };
 
 /**

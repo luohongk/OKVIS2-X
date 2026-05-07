@@ -228,6 +228,11 @@ class MultiFrame
   inline const unsigned char * keypointDescriptor(size_t cameraIdx,
                                                   size_t keypointIdx) const;
 
+  /// \brief Returns the OpenCV depth type of the stored descriptors for a camera.
+  /// @param[in] cameraIdx The camera index.
+  /// \return e.g. CV_8U for BRISK binary, CV_32F for SuperPoint float descriptors.
+  inline int descriptorType(size_t cameraIdx) const;
+
   /// \brief Set the landmark ID
   /// @param[in] cameraIdx The camera index.
   /// @param[in] keypointIdx The requested keypoint's index.

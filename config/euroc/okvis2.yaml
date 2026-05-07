@@ -78,6 +78,13 @@ frontend_parameters:
     use_cnn: false # use the CNN (if available) to filter out dynamic content / sky
     parallelise_detection: true # Run parallel detect & describe.
     num_matching_threads: 4 # Parallelise matching with this number of threads.
+    use_dl_features: true # use deep-learning features (SuperPoint + LightGlue via ONNX Runtime)
+    dl_extractor_type: superpoint # only superpoint supported
+    dl_extractor_path: "/home/lhk/workspace/OKVIS2-X/weight/superpoint.onnx" # path to the SuperPoint ONNX model file
+    dl_matcher_path: "/home/lhk/workspace/OKVIS2-X/weight/superpoint_lightglue_fused_cpu.onnx" # path to the LightGlue ONNX model file
+    dl_match_threshold: 0.7 # LightGlue match confidence threshold [0,1]
+    dl_image_size: 512 # image will be resized to this (longest edge) before inference
+    dl_use_gpu: false # use ONNX Runtime CUDA execution provider (set true only with CUDA 11 + cuDNN 8)
 
 # estimator parameters
 estimator_parameters:

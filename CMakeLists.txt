@@ -20,6 +20,8 @@ option (USE_NN
         "Use keypoint classification as part of okvis, requires torch" ON)
 option (USE_GPU
         "Use keypoint classification with GPU inference, requires torch with Cuda" OFF)
+option (USE_DL_FEATURES
+        "Use SuperPoint+LightGlue via ONNX Runtime for feature extraction" OFF)
 option (DO_TIMING
         "Enable timing" ON)
 option (BUILD_SHARED_LIBS

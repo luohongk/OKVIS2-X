@@ -15,6 +15,27 @@ if(USE_NN AND NOT Torch_FOUND)
   find_package(Torch REQUIRED)
 endif()
 
+# ---------------------------------------------------------------------------
+# ONNX Runtime for deep-learning feature extraction (SuperPoint + LightGlue)
+# ---------------------------------------------------------------------------
+if(USE_DL_FEATURES)
+  # Prefer an explicit hint via -DOnnxRuntime_DIR=<path>
+  if(NOT OnnxRuntime_DIR)
+    set(OnnxRuntime_DIR "/home/lhk/ThirdParty/onnxruntime-linux-x64-gpu-1.16.3" CACHE PATH
+        "Root directory of ONNX Runtime (contains include/ and lib/)")
+  endif()
+  find_path(OnnxRuntime_INCLUDE_DIR
+    NAMES onnxruntime_cxx_api.h
+    PATHS "${OnnxRuntime_DIR}/include"
+    REQUIRED)
+  find_library(OnnxRuntime_LIBRARY
+    NAMES onnxruntime
+    PATHS "${OnnxRuntime_DIR}/lib"
+    REQUIRED)
+  message(STATUS "Found ONNX Runtime headers: ${OnnxRuntime_INCLUDE_DIR}")
+  message(STATUS "Found ONNX Runtime library: ${OnnxRuntime_LIBRARY}")
+endif()
+
 set(LIB_NAME okvis_frontend)
 add_library(${LIB_NAME}
   include/DBoW2/FBrisk.hpp
@@ -32,6 +53,12 @@ add_library(${LIB_NAME}
   src/LoopclosureNoncentralAbsoluteAdapter.cpp
   src/stereo_triangulation.cpp
 )
+if(USE_DL_FEATURES)
+  target_sources(${LIB_NAME} PRIVATE
+    include/okvis/dl_features/DLFeatureExtractor.hpp
+    src/dl_features/DLFeatureExtractor.cpp
+  )
+endif()
 target_include_directories(${LIB_NAME}
   PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -42,6 +69,9 @@ target_include_directories(${LIB_NAME}
     ${OPENGV_INCLUDE_DIRS}
     ${TORCH_INCLUDE_DIRS}
 )
+if(USE_DL_FEATURES)
+  target_include_directories(${LIB_NAME} PUBLIC ${OnnxRuntime_INCLUDE_DIR})
+endif()
 target_link_libraries(${LIB_NAME}
   PUBLIC
     Eigen3::Eigen
@@ -59,6 +89,9 @@ target_link_libraries(${LIB_NAME}
     ${TORCH_LIBRARIES}
     Ceres::ceres
 )
+if(USE_DL_FEATURES)
+  target_link_libraries(${LIB_NAME} PRIVATE ${OnnxRuntime_LIBRARY})
+endif()
 target_compile_features(${LIB_NAME} PUBLIC cxx_std_${OKVIS_CXX_STANDARD})
 target_compile_options(${LIB_NAME}
   PUBLIC
@@ -69,6 +102,12 @@ target_compile_options(${LIB_NAME}
 if(USE_NN)
   target_compile_definitions(${LIB_NAME} PUBLIC OKVIS_USE_NN C10_USE_GLOG)
   target_compile_options(${LIB_NAME} PUBLIC ${TORCH_CXX_FLAGS})
+  if(USE_GPU)
+    target_compile_definitions(${LIB_NAME} PUBLIC OKVIS_USE_GPU)
+  endif()
+endif()
+if(USE_DL_FEATURES)
+  target_compile_definitions(${LIB_NAME} PUBLIC OKVIS_USE_DL_FEATURES)
   if(USE_GPU)
     target_compile_definitions(${LIB_NAME} PUBLIC OKVIS_USE_GPU)
   endif()

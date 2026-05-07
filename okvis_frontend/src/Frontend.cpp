@@ -27,6 +27,7 @@
 #include <brisk/brisk.h>
 
 #include <opencv2/imgproc/imgproc.hpp>
+#include <opencv2/calib3d.hpp>
 
 #include <glog/logging.h>
 
@@ -86,6 +87,31 @@ namespace okvis {
 
 static const double kptrad = 0.09;
 //cv::Ptr<cv::CLAHE> mClahe;
+
+// ---------------------------------------------------------------------------
+// Descriptor matching helpers (BRISK Hamming vs DL cosine distance)
+// ---------------------------------------------------------------------------
+
+/// @brief Hamming distance between two BRISK descriptors (48 bytes each).
+inline double briskDescDist(const uchar* a, const uchar* b) {
+  return static_cast<double>(brisk::Hamming::PopcntofXORed(a, b, 3));
+}
+
+/// @brief Cosine *distance* (1 - cosine_similarity) between two L2-normalised float descriptors.
+/// Lower = more similar.  Returns value in [0, 2].
+inline double dlDescDist(const float* a, const float* b, int D) {
+  double dot = 0.0;
+  for (int i = 0; i < D; ++i) dot += static_cast<double>(a[i]) * static_cast<double>(b[i]);
+  // SuperPoint descriptors are L2-normalised; cosine similarity == dot product.
+  return 1.0 - dot;
+}
+
+/// @brief Returns true if the current multiframe uses DL (float32) descriptors.
+inline bool isDLDescriptor(const MultiFramePtr& mf, size_t cam) {
+  if (mf->numKeypoints(cam) == 0) return false;
+  // BRISK descriptors stored as CV_8U; DL (SuperPoint/DISK) stored as CV_32F.
+  return mf->descriptorType(cam) == CV_32F;
+}
 
 /// \brief Opaque stuct to use DBoW for loop closure.
 class Frontend::DBoW {
@@ -160,6 +186,44 @@ Frontend::~Frontend() {
   endCnnThreads();
 }
 
+// ---------------------------------------------------------------------------
+// Initialise SuperPoint + LightGlue ORT sessions
+// ---------------------------------------------------------------------------
+void Frontend::initialiseDlFeatures(const okvis::ViParameters& params)
+{
+#ifdef OKVIS_USE_DL_FEATURES
+  if (dlFeaturesInitialised_) return;
+
+  const auto& fp = params.frontend;
+  if (!fp.use_dl_features) return;
+
+  if (fp.dl_extractor_path.empty()) {
+    LOG(WARNING) << "[DLFeatures] dl_extractor_path not set – DL features disabled.";
+    return;
+  }
+  if (fp.dl_matcher_path.empty()) {
+    LOG(WARNING) << "[DLFeatures] dl_matcher_path not set – DL features disabled.";
+    return;
+  }
+
+  try {
+    bool useGpu = fp.dl_use_gpu;
+    dlExtractor_ = std::make_unique<dl::DLFeatureExtractor>(
+        fp.dl_extractor_path, useGpu, 0, fp.dl_image_size);
+    dlMatcher_ = std::make_unique<dl::DLFeatureMatcher>(
+        fp.dl_matcher_path, fp.dl_match_threshold, useGpu, 0);
+    dlFeaturesInitialised_ = true;
+    LOG(INFO) << "[DLFeatures] Initialised SuperPoint+LightGlue ("
+              << (useGpu ? "GPU" : "CPU") << "), image_size=" << fp.dl_image_size
+              << ", match_threshold=" << fp.dl_match_threshold;
+  } catch (const std::exception& e) {
+    LOG(ERROR) << "[DLFeatures] Initialisation failed: " << e.what();
+  }
+#else
+  (void)params;
+#endif
+}
+
 bool Frontend::loadComponent(std::string filename,
                              const ImuParameters &imuParameters,
                              const cameras::NCameraSystem &nCameraSystem,
@@ -179,12 +243,20 @@ bool Frontend::loadComponent(std::string filename,
 
   // fill component DBoW
   for (const auto &multiFrame : components_.back().multiFrames_) {
-    // first get features
+    // first get features -- DBoW uses BRISK binary only; skip for DL descriptors
+    const bool dlModeDB = (multiFrame.second->numKeypoints() > 0
+        && numCameras_ > 0
+        && multiFrame.second->numKeypoints(0) > 0
+        && multiFrame.second->descriptorType(0) == CV_32F);
+    if(dlModeDB) {
+      // DL descriptors cannot be added to the BRISK DBoW vocabulary -- skip
+      continue;
+    }
     std::vector<std::vector<uchar>> features(multiFrame.second->numKeypoints());
     int offset = 0;
     for (size_t im = 0; im < numCameras_; ++im) {
       for (size_t k = 0; k < multiFrame.second->numKeypoints(im); ++k) {
-        features.at(k + offset).resize(48); // TODO: get 48 from feature
+        features.at(k + offset).resize(48);
         memcpy(features.at(k + offset).data(),
                multiFrame.second->keypointDescriptor(im, k),
                48 * sizeof(uchar));
@@ -206,10 +278,64 @@ bool Frontend::detectAndDescribe(size_t cameraIndex, std::shared_ptr<okvis::Mult
                                  const std::vector<cv::KeyPoint>* keypoints) {
   OKVIS_ASSERT_TRUE_DBG(Exception, cameraIndex < numCameras_,
                         "Camera index exceeds number of cameras.")
-  std::lock_guard<std::mutex> lock(*featureDetectorMutexes_[cameraIndex]);
 
   // check there are no keypoints here
   OKVIS_ASSERT_TRUE(Exception, keypoints == nullptr, "external keypoints currently not supported")
+
+#ifdef OKVIS_USE_DL_FEATURES
+  // -----------------------------------------------------------------------
+  // Deep-learning path: SuperPoint (or DISK) + inject into Frame
+  // -----------------------------------------------------------------------
+  if (dlFeaturesInitialised_) {
+    std::lock_guard<std::mutex> dlLock(dlMutex_);
+
+    const cv::Mat& img = frameOut->image(cameraIndex);
+
+    std::vector<cv::Point2f> pts;
+    std::vector<float>       scores;
+    cv::Mat                  descs;
+
+    bool ok = dlExtractor_->extract(img, pts, scores, descs);
+    if (!ok || pts.empty()) {
+      LOG(WARNING) << "[DLFeatures] cam " << cameraIndex << ": extraction returned 0 keypoints.";
+      // Fall through to BRISK as fallback
+      goto brisk_path;
+    }
+
+    // Convert to cv::KeyPoint and inject into Frame
+    {
+      const int N = static_cast<int>(pts.size());
+      std::vector<cv::KeyPoint> cvKpts;
+      cvKpts.reserve(N);
+      for (int i = 0; i < N; ++i) {
+        cv::KeyPoint kp;
+        kp.pt       = pts[i];
+        kp.size     = 12.0f;  // matches single-scale BRISK base size; sets ~3.8px RANSAC inlier threshold
+        kp.angle    = -1.0f;
+        kp.response = scores[i];
+        kp.octave   = 0;
+        kp.class_id = -1;
+        cvKpts.push_back(kp);
+      }
+
+      // Descriptors: descs is [N, D] CV_32F
+      // Frame stores descriptors as cv::Mat (supports both CV_8U for BRISK and CV_32F for DL)
+      frameOut->resetKeypoints(cameraIndex, cvKpts);
+      frameOut->resetDescriptors(cameraIndex, descs);
+    }
+
+    // Precompute backprojections (needed by the estimator / triangulation)
+    frameOut->computeBackProjections(cameraIndex);
+
+    return true;
+  }
+  brisk_path:
+#endif
+
+  // -----------------------------------------------------------------------
+  // Classic BRISK path (also fallback when DL is not initialised)
+  // -----------------------------------------------------------------------
+  std::lock_guard<std::mutex> lock(*featureDetectorMutexes_[cameraIndex]);
 
   // hack: also initialise those maps for camera-aware extraction
   for (size_t i = 0; i < numCameras_; ++i) {
@@ -273,73 +399,187 @@ bool Frontend::verifyRecognisedPlace(const Estimator &estimator,
 
   // find matchable points
   TimerSwitchable loopClosureDescriptorMatchingTimer("2.04 loop closure descriptor matching");
-  for (size_t im = 0; im < params.nCameraSystem.numCameras(); ++im) {
-    for (size_t kOld = 0; kOld < oldFrame->numKeypoints(im); ++kOld) {
-      uint64_t lmId = oldFrame->landmarkId(im, kOld);
-      if (lmId == 0) {
-        continue;
-      }
-      // get the 3D points / descriptors from old frame
-      const uchar *oldDescripor = oldFrame->keypointDescriptor(im, kOld);
-      Eigen::Vector4d landmark;
-      bool isInitialised = false;
-      oldFrame->getLandmark(im, kOld, landmark, isInitialised);
-      if (!isInitialised)
-        continue;
-      if (landmark.norm() < 1.0e-12) {
-        continue; // bit of a hack, signals there was no associated 3d point
-      }
+
+#ifdef OKVIS_USE_DL_FEATURES
+  const bool dlModeLC   = (framesInOut->numKeypoints() > 0
+                           && framesInOut->descriptorType(0) == CV_32F);
+  const bool oldFrameDL = (oldFrame->numKeypoints() > 0
+                           && oldFrame->descriptorType(0) == CV_32F);
+
+  if (dlModeLC && oldFrameDL && dlMatcher_) {
+    for (size_t im = 0; im < params.nCameraSystem.numCameras(); ++im) {
+      const size_t numNew = framesInOut->numKeypoints(im);
+      const size_t numOld = oldFrame->numKeypoints(im);
+      if (numNew == 0 || numOld == 0) continue;
+
+      // Collect old keypoints that have valid 3D landmarks
+      std::vector<size_t>       oldKptIdx;
+      std::vector<cv::Point2f>  oldKpts;
+      oldKptIdx.reserve(numOld);
+      oldKpts.reserve(numOld);
+      for (size_t kOld = 0; kOld < numOld; ++kOld) {
+        uint64_t lmId = oldFrame->landmarkId(im, kOld);
+        if (!lmId) continue;
+        Eigen::Vector4d lm;
+        bool isInit = false;
+        oldFrame->getLandmark(im, kOld, lm, isInit);
+        if (!isInit || lm.norm() < 1.0e-12) continue;
 #ifdef OKVIS_USE_NN
-      if (params.frontend.use_cnn && oldFrame->isClassified(im)) {
-        // make sure not to use sky or person points here
-        cv::Mat classification;
-        oldFrame->getClassification(im, kOld, classification);
-        if (classification.at<float>(10) > 3.5f) { // Sky
-          continue;
+        if (params.frontend.use_cnn && oldFrame->isClassified(im)) {
+          cv::Mat cls;
+          oldFrame->getClassification(im, kOld, cls);
+          if (cls.at<float>(10) > 3.5f) continue;  // Sky
+          if (cls.at<float>(11) > 53.5f) continue; // Person
         }
-        if (classification.at<float>(11) > 53.5f) { // Person
-          continue;
+#endif
+        cv::KeyPoint kp;
+        oldFrame->getCvKeypoint(im, kOld, kp);
+        oldKpts.push_back(kp.pt);
+        oldKptIdx.push_back(kOld);
+        // accumulate landmarks map for RANSAC adapter
+        LandmarkId lid(lmId);
+        if (landmarks.find(lid) == landmarks.end()) {
+          landmarks[lid] = lm;
         }
       }
-#endif
-      auto iter = descriptors.find(LandmarkId(lmId));
-      if (iter != descriptors.end()) {
-        // just add descriptor
-        iter->second.push_back(oldDescripor);
-      } else {
-        descriptors[LandmarkId(lmId)].push_back(oldDescripor);
-        landmarks[LandmarkId(lmId)] = landmark;
+      if (oldKptIdx.empty()) continue;
+
+      // Build old descriptor matrix [numOldValid, 256]
+      cv::Mat oldDesc(static_cast<int>(oldKptIdx.size()), 256, CV_32F);
+      for (size_t i = 0; i < oldKptIdx.size(); ++i) {
+        std::memcpy(oldDesc.ptr<float>(static_cast<int>(i)),
+                    oldFrame->keypointDescriptor(im, oldKptIdx[i]),
+                    256 * sizeof(float));
+      }
+
+      // Collect current frame keypoints + descriptors
+      std::vector<cv::Point2f> newKpts;
+      newKpts.reserve(numNew);
+      for (size_t k = 0; k < numNew; ++k) {
+        cv::KeyPoint kp;
+        framesInOut->getCvKeypoint(im, k, kp);
+        newKpts.push_back(kp.pt);
+      }
+      cv::Mat newDesc(static_cast<int>(numNew), 256, CV_32F);
+      for (size_t k = 0; k < numNew; ++k) {
+        std::memcpy(newDesc.ptr<float>(static_cast<int>(k)),
+                    framesInOut->keypointDescriptor(im, k),
+                    256 * sizeof(float));
+      }
+
+      // Run LightGlue: match current (query) → old (train)
+      std::vector<cv::DMatch> lgMatches;
+      std::vector<float>      lgScores;
+      {
+        std::lock_guard<std::mutex> dlLock(dlMutex_);
+        dlMatcher_->match(newKpts, oldKpts, newDesc, oldDesc,
+                          framesInOut->image(im).rows, framesInOut->image(im).cols,
+                          oldFrame->image(im).rows,    oldFrame->image(im).cols,
+                          lgMatches, lgScores);
+      }
+
+      for (const auto& m : lgMatches) {
+        const size_t kNew     = static_cast<size_t>(m.queryIdx);
+        const size_t kOldOrig = oldKptIdx[static_cast<size_t>(m.trainIdx)];
+        uint64_t lmId = oldFrame->landmarkId(im, kOldOrig);
+        Eigen::Vector4d lm;
+        bool isInit = false;
+        oldFrame->getLandmark(im, kOldOrig, lm, isInit);
+        if (!isInit || lm.norm() < 1.0e-12) continue;
+        ctr++;
+        const KeypointIdentifier kid(framesInOut->id(), im, kNew);
+        points[lmId] = lm;
+        matches[kid] = lmId;
       }
     }
-  }
-
-  // match
-  for (auto iter = landmarks.begin(); iter != landmarks.end(); ++iter) {
+  } else
+#endif
+  {
     for (size_t im = 0; im < params.nCameraSystem.numCameras(); ++im) {
-
-      if(framesInOut->numKeypoints(im) == 0) {
-        continue;
-      }
-      
-      const uchar *ddata = framesInOut->keypointDescriptor(im, 0);
-      const size_t K = framesInOut->numKeypoints(im);
-      uint32_t distMin = briskMatchingThreshold_;
-      size_t kMin = 0;
-      for (const unsigned char* oldDescripor : descriptors.at(iter->first)) {
-        for (size_t k = 0; k < K; ++k) {
-          const uint32_t dist = brisk::Hamming::PopcntofXORed(ddata + 48 * k, oldDescripor, 3);
-          if (dist < distMin) {
-            distMin = dist;
-            kMin = k;
+      for (size_t kOld = 0; kOld < oldFrame->numKeypoints(im); ++kOld) {
+        uint64_t lmId = oldFrame->landmarkId(im, kOld);
+        if (lmId == 0) {
+          continue;
+        }
+        // get the 3D points / descriptors from old frame
+        const uchar *oldDescripor = oldFrame->keypointDescriptor(im, kOld);
+        Eigen::Vector4d landmark;
+        bool isInitialised = false;
+        oldFrame->getLandmark(im, kOld, landmark, isInitialised);
+        if (!isInitialised)
+          continue;
+        if (landmark.norm() < 1.0e-12) {
+          continue; // bit of a hack, signals there was no associated 3d point
+        }
+#ifdef OKVIS_USE_NN
+        if (params.frontend.use_cnn && oldFrame->isClassified(im)) {
+          // make sure not to use sky or person points here
+          cv::Mat classification;
+          oldFrame->getClassification(im, kOld, classification);
+          if (classification.at<float>(10) > 3.5f) { // Sky
+            continue;
+          }
+          if (classification.at<float>(11) > 53.5f) { // Person
+            continue;
           }
         }
+#endif
+        auto iter = descriptors.find(LandmarkId(lmId));
+        if (iter != descriptors.end()) {
+          // just add descriptor
+          iter->second.push_back(oldDescripor);
+        } else {
+          descriptors[LandmarkId(lmId)].push_back(oldDescripor);
+          landmarks[LandmarkId(lmId)] = landmark;
+        }
       }
-      // now get best match
-      if (distMin < briskMatchingThreshold_) {
-        ctr++;
-        const KeypointIdentifier kid(framesInOut->id(), im, kMin);
-        points[iter->first.value()] = iter->second;
-        matches[kid] = iter->first.value();
+    }
+
+    // match
+    for (auto iter = landmarks.begin(); iter != landmarks.end(); ++iter) {
+      for (size_t im = 0; im < params.nCameraSystem.numCameras(); ++im) {
+
+        if(framesInOut->numKeypoints(im) == 0) {
+          continue;
+        }
+
+        const uchar *ddata = framesInOut->keypointDescriptor(im, 0);
+        const bool dlModeLC2 = (framesInOut->descriptorType(im) == CV_32F);
+        const int descColsLC  = dlModeLC2 ? 256 : 48;
+        const int descBytesLC = dlModeLC2 ? descColsLC * static_cast<int>(sizeof(float)) : descColsLC;
+        const size_t K = framesInOut->numKeypoints(im);
+        double distMin = dlModeLC2
+            ? (1.0 - static_cast<double>(params.frontend.dl_match_threshold))
+            : static_cast<double>(briskMatchingThreshold_);
+        size_t kMin = 0;
+        for (const unsigned char* oldDescripor : descriptors.at(iter->first)) {
+          for (size_t k = 0; k < K; ++k) {
+            double dist;
+            if (dlModeLC2) {
+              dist = dlDescDist(
+                  reinterpret_cast<const float*>(ddata) + k * descColsLC,
+                  reinterpret_cast<const float*>(oldDescripor),
+                  descColsLC);
+            } else {
+              dist = static_cast<double>(brisk::Hamming::PopcntofXORed(
+                  ddata + static_cast<size_t>(descBytesLC) * k, oldDescripor, 3));
+            }
+            if (dist < distMin) {
+              distMin = dist;
+              kMin = k;
+            }
+          }
+        }
+        // now get best match
+        const double matchThresholdLC = dlModeLC2
+            ? (1.0 - static_cast<double>(params.frontend.dl_match_threshold))
+            : static_cast<double>(briskMatchingThreshold_);
+        if (distMin < matchThresholdLC) {
+          ctr++;
+          const KeypointIdentifier kid(framesInOut->id(), im, kMin);
+          points[iter->first.value()] = iter->second;
+          matches[kid] = iter->first.value();
+        }
       }
     }
   }
@@ -387,45 +627,49 @@ bool Frontend::verifyRecognisedPlace(const Estimator &estimator,
     inliers.at(size_t(ransac.inliers_.at(i))) = true;
   }
 
-  // check distinciveness of survived matches
+  // check distinciveness of survived matches (BRISK binary descriptors only)
   float sum = 0.0;
-  for (size_t im = 0; im < numCameras_; ++im) {
-    Eigen::Matrix<float, Eigen::Dynamic, 48 * 8> descriptorMatrix(ransac.inliers_.size(), 48 * 8);
-    int inlierCtr = 0;
-    int ctr2 = 0;
-    for (const auto &match : matches) {
-      if (match.first.cameraIndex != im) {
-        ctr2++;
-        continue;
-      }
-      const uchar *desc = framesInOut->keypointDescriptor(match.first.cameraIndex,
-                                                          match.first.keypointIndex);
-      if (inliers[ctr2]) {
-        for (size_t b = 0; b < 48; b++) {
-          for (size_t c = 0; c < 8; c++) {
-            if (desc[b] & (1 << c)) {
-              descriptorMatrix(inlierCtr, b * 8 + c) = 1.0;
-            } else {
-              descriptorMatrix(inlierCtr, b * 8 + c) = 0.0;
+  const bool dlModeVerify = (framesInOut->numKeypoints(0) > 0 &&
+                              framesInOut->descriptorType(0) == CV_32F);
+  if (!dlModeVerify) {
+    for (size_t im = 0; im < numCameras_; ++im) {
+      Eigen::Matrix<float, Eigen::Dynamic, 48 * 8> descriptorMatrix(ransac.inliers_.size(), 48 * 8);
+      int inlierCtr = 0;
+      int ctr2 = 0;
+      for (const auto &match : matches) {
+        if (match.first.cameraIndex != im) {
+          ctr2++;
+          continue;
+        }
+        const uchar *desc = framesInOut->keypointDescriptor(match.first.cameraIndex,
+                                                            match.first.keypointIndex);
+        if (inliers[ctr2]) {
+          for (size_t b = 0; b < 48; b++) {
+            for (size_t c = 0; c < 8; c++) {
+              if (desc[b] & (1 << c)) {
+                descriptorMatrix(inlierCtr, b * 8 + c) = 1.0;
+              } else {
+                descriptorMatrix(inlierCtr, b * 8 + c) = 0.0;
+              }
             }
           }
+          inlierCtr++;
         }
-        inlierCtr++;
+        ctr2++;
       }
-      ctr2++;
-    }
-    if (inlierCtr > 0) {
-      descriptorMatrix.conservativeResize(inlierCtr, 48 * 8);
-      Eigen::Matrix<float, 1, 48 * 8> stdev
-        = ((descriptorMatrix.rowwise() - descriptorMatrix.colwise().mean()).colwise().squaredNorm()
-           / (descriptorMatrix.rows() - 1))
-            .cwiseSqrt();
-      sum += float(inlierCtr) * stdev.sum();
+      if (inlierCtr > 0) {
+        descriptorMatrix.conservativeResize(inlierCtr, 48 * 8);
+        Eigen::Matrix<float, 1, 48 * 8> stdev
+          = ((descriptorMatrix.rowwise() - descriptorMatrix.colwise().mean()).colwise().squaredNorm()
+             / (descriptorMatrix.rows() - 1))
+              .cwiseSqrt();
+        sum += float(inlierCtr) * stdev.sum();
+      }
     }
   }
 
   const float avg = sum / float(ransac.inliers_.size());
-  if (avg < 182.0 && ransac.inliers_.size() < 20) {
+  if (!dlModeVerify && avg < 182.0 && ransac.inliers_.size() < 20) {
     LOG(INFO) << framesInOut->id() << "->" << oldFrame->id() << " : "
               << "Rejecting loop closure due to indistincive descriptors (" << avg << ")";
     return false;
@@ -675,6 +919,9 @@ bool Frontend::dataAssociationAndInitialization(
     Estimator &estimator, const okvis::ViParameters& params,
     std::shared_ptr<okvis::MultiFrame> framesInOut, bool kfPrior, bool* asKeyframe) {
 
+  // Lazily initialise DL feature sessions (no-op if already done or disabled)
+  initialiseDlFeatures(params);
+
   // match new keypoints to existing landmarks/keypoints
   // initialise new landmarks (states)
   // outlier rejection by consistency check
@@ -787,18 +1034,44 @@ bool Frontend::dataAssociationAndInitialization(
     *asKeyframe = true;  // first frame needs to be keyframe
   }
 
-  // prepare features for place recognition
-  std::vector<std::vector<uchar>> features(framesInOut->numKeypoints());
-  // first, we are trying to match the database for loop closures
-  int offset = 0;
-  for (size_t im = 0; im < numCameras_; ++im) {
-    for (size_t k = 0; k < framesInOut->numKeypoints(im); ++k) {
-      features.at(k + offset).resize(48); // TODO: get 48 from feature
-      memcpy(features.at(k + offset).data(),
-             framesInOut->keypointDescriptor(im, k),
-             48 * sizeof(uchar));
+  // prepare features for place recognition (BRISK DBoW)
+  // In DL mode we run a side BRISK detection on camera 0 to get descriptors for DBoW
+  const bool dlModeForDBoW = (framesInOut->numKeypoints() > 0
+      && numCameras_ > 0
+      && framesInOut->numKeypoints(0) > 0
+      && framesInOut->descriptorType(0) == CV_32F);
+  std::vector<std::vector<uchar>> features;
+  if(!dlModeForDBoW) {
+    // BRISK mode: copy descriptors directly from the frame
+    features.resize(framesInOut->numKeypoints());
+    int offset = 0;
+    for (size_t im = 0; im < numCameras_; ++im) {
+      for (size_t k = 0; k < framesInOut->numKeypoints(im); ++k) {
+        features.at(k + offset).resize(48);
+        memcpy(features.at(k + offset).data(),
+               framesInOut->keypointDescriptor(im, k),
+               48 * sizeof(uchar));
+      }
+      offset += framesInOut->numKeypoints(im);
     }
-    offset += framesInOut->numKeypoints(im);
+  } else {
+#ifdef OKVIS_USE_DL_FEATURES
+    // DL mode: run BRISK detect+describe on camera 0 image for DBoW only
+    std::vector<cv::KeyPoint> briskKpts;
+    cv::Mat briskDescs;
+    {
+      std::lock_guard<std::mutex> lock(*featureDetectorMutexes_[0]);
+      featureDetectors_[0]->detect(framesInOut->image(0), briskKpts);
+      if (!briskKpts.empty()) {
+        descriptorExtractors_[0]->compute(framesInOut->image(0), briskKpts, briskDescs);
+      }
+    }
+    features.resize(briskKpts.size());
+    for (size_t k = 0; k < briskKpts.size(); ++k) {
+      features[k].resize(48);
+      memcpy(features[k].data(), briskDescs.ptr<uchar>(static_cast<int>(k)), 48 * sizeof(uchar));
+    }
+#endif
   }
 
   /*MULTI-SESSION AND MULTI-AGENT*/
@@ -1338,8 +1611,12 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
 
     // go through all landmarks
     const size_t numDescriptorsToKeep = 3; // use only best 3
+    const bool dlMode = isDLDescriptor(multiFrame, im);
+    const int descWidth = dlMode ? 256 : 48;
+    const int descType  = dlMode ? CV_32FC1 : CV_8UC1;
+    const int descBytes = dlMode ? descWidth * static_cast<int>(sizeof(float)) : descWidth;
     descriptorPool[im] = cv::Mat(
-        int(numDescriptorsToKeep)*pointMap.size(), 48, CV_8UC1);
+        int(numDescriptorsToKeep)*pointMap.size(), descWidth, descType);
     uchar* dataPtr = descriptorPool[im].data;
     for(MapPoints::const_iterator it = pointMap.begin(); it != pointMap.end(); ++it) {
       if(loopClosureLandmarksToUseExclusively) {
@@ -1384,7 +1661,7 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
       // obtain map point descriptor, and do some pruning.
       std::vector<double> bestScores(numDescriptorsToKeep, 1.0);
       landmarkToMatch.descriptors = cv::Mat(
-          int(numDescriptorsToKeep), 48, CV_8UC1, dataPtr);
+          int(numDescriptorsToKeep), descWidth, descType, dataPtr);
       landmarkToMatch.e_W.resize(3,numDescriptorsToKeep);
       landmarkToMatch.r_W.resize(3,numDescriptorsToKeep);
       landmarkToMatch.kids.reserve(numDescriptorsToKeep);
@@ -1443,9 +1720,9 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
           const MultiFramePtr oldFrame =
               estimator.multiFrame(StateId(kid.frameId));
           std::memcpy(
-              landmarkToMatch.descriptors.data+48*worstIdx,
+              landmarkToMatch.descriptors.data + descBytes * static_cast<int>(worstIdx),
               oldFrame->keypointDescriptor(
-                  kid.cameraIndex, kid.keypointIndex), 48);
+                  kid.cameraIndex, kid.keypointIndex), static_cast<size_t>(descBytes));
 
           // remember some other stuff for efficiency
           Eigen::Vector3d e_C;
@@ -1461,10 +1738,10 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
       }
 
       // crop unused bottom rows / right cols
-      landmarkToMatch.descriptors = landmarkToMatch.descriptors(cv::Rect(0, 0, 48, o + 1));
+      landmarkToMatch.descriptors = landmarkToMatch.descriptors(cv::Rect(0, 0, descWidth, static_cast<int>(o) + 1));
       landmarkToMatch.e_W.conservativeResize(3,o + 1);
       landmarkToMatch.r_W.conservativeResize(3,o + 1);
-      dataPtr += (o + 1)*48;
+      dataPtr += (o + 1)*static_cast<size_t>(descBytes);
 
       if(landmarkToMatch.descriptors.rows==0) {
         // no observations -- weird.
@@ -1484,7 +1761,10 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
     // multithreaded matching
     const size_t num_matching_threads = size_t(params.frontend.num_matching_threads);
 
-    std::vector<double> distances(numKeypoints,briskMatchingThreshold_);
+    const double matchThreshold = isDLDescriptor(multiFrame, im)
+        ? (1.0 - static_cast<double>(params.frontend.dl_match_threshold))
+        : briskMatchingThreshold_;
+    std::vector<double> distances(numKeypoints, matchThreshold);
     std::vector<LandmarkId> lmIds(numKeypoints);
     AlignedVector<Eigen::Vector4d> hps_W(numKeypoints, Eigen::Vector4d::Zero());
     std::vector<size_t> ctrs(num_matching_threads);
@@ -1595,7 +1875,10 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
     // multithreaded matching
     const size_t num_matching_threads = size_t(params.frontend.num_matching_threads);
 
-    std::vector<double> distances(numKeypoints,briskMatchingThreshold_);
+    const double matchThresholdUninit = isDLDescriptor(multiFrame, im)
+        ? (1.0 - static_cast<double>(params.frontend.dl_match_threshold))
+        : briskMatchingThreshold_;
+    std::vector<double> distances(numKeypoints, matchThresholdUninit);
     std::vector<LandmarkId> lmIds(numKeypoints);
     AlignedVector<Eigen::Vector4d> hps_W(numKeypoints, Eigen::Vector4d::Zero());
     std::vector<size_t> ctrs(num_matching_threads);
@@ -1743,6 +2026,11 @@ void Frontend::matchToMapByThread(
   const size_t startK = segment*threadIdx;
   const size_t endK = threadIdx+1 == numThreads ? numKeypoints : startK + segment;
   const uchar* ddata = multiFrame->keypointDescriptor(im, 0);
+  const bool dlMode = (multiFrame->descriptorType(im) == CV_32F);
+  // For DL: descriptor stride in bytes = 256 * sizeof(float)
+  // For BRISK: descriptor stride in bytes = 48
+  const int descCols = dlMode ? 256 : 48;
+  const int descBytes = dlMode ? descCols * static_cast<int>(sizeof(float)) : descCols;
   Eigen::Matrix2Xd keypoints(2,numKeypoints);
   std::vector<bool> use(numKeypoints, true);
   for(size_t k = startK; k < endK; k++) {
@@ -1781,11 +2069,19 @@ void Frontend::matchToMapByThread(
         continue;
       }
 
-      const uchar* descriptorK = ddata + k*48;
+      const uchar* descriptorK = ddata + static_cast<size_t>(descBytes) * k;
       for(int d = 0; d<it->second.descriptors.rows; ++d) {
-        const double dist = brisk::Hamming::PopcntofXORed(
-            descriptorK,
-            it->second.descriptors.data + d*48, 3);
+        double dist;
+        if (dlMode) {
+          dist = dlDescDist(
+              reinterpret_cast<const float*>(descriptorK),
+              reinterpret_cast<const float*>(it->second.descriptors.data) + d * descCols,
+              descCols);
+        } else {
+          dist = briskDescDist(
+              descriptorK,
+              it->second.descriptors.data + d * descCols);
+        }
         if(dist < distances[k]) {
           distances[k] = dist;
           lmIds[k] = it->first;
@@ -1826,6 +2122,9 @@ void Frontend::matchToMapByThreadUnitialised(
   const size_t startK = segment*threadIdx;
   const size_t endK = threadIdx+1 == numThreads ? numKeypoints : startK + segment;
   const uchar* ddata = multiFrame->keypointDescriptor(im, 0);
+  const bool dlMode = (multiFrame->descriptorType(im) == CV_32F);
+  const int descCols  = dlMode ? 256 : 48;
+  const int descBytes = dlMode ? descCols * static_cast<int>(sizeof(float)) : descCols;
   Eigen::Matrix3Xd e_Ws(3,numKeypoints);
   std::vector<uint64_t> previousIds(numKeypoints,0);
   std::vector<bool> use(numKeypoints,false);
@@ -1865,10 +2164,19 @@ void Frontend::matchToMapByThreadUnitialised(
 
       // also check epipolar distance (later)
       const Eigen::Vector3d e1_W=e_Ws.col(k);
-      const uchar* descriptorK = ddata + k*48;
+      const uchar* descriptorK = ddata + static_cast<size_t>(descBytes) * k;
       for(int d = 0; d<it->second.descriptors.rows; ++d) {
-        const double dist = brisk::Hamming::PopcntofXORed(
-            descriptorK, it->second.descriptors.data + d*48, 3);
+        double dist;
+        if (dlMode) {
+          dist = dlDescDist(
+              reinterpret_cast<const float*>(descriptorK),
+              reinterpret_cast<const float*>(it->second.descriptors.data) + d * descCols,
+              descCols);
+        } else {
+          dist = briskDescDist(
+              descriptorK,
+              it->second.descriptors.data + d * descCols);
+        }
 
         if(dist < distances[k]) {
 
@@ -1994,129 +2302,211 @@ int Frontend::matchMotionStereo(Estimator& estimator, const ViParameters &params
       const double f0 = 0.5* (camera->focalLengthU() + camera->focalLengthV());
 
       // preprocess matchable set, get descriptors close in memory
+      const bool dlModeTemp = (k1Size > 0 && multiFrame1->descriptorType(im) == CV_32F);
+      const int descWidthTemp = dlModeTemp ? 256 : 48;
+      const int descTypeTemp  = dlModeTemp ? CV_32FC1 : CV_8UC1;
+      const int descBytesTemp = dlModeTemp ? descWidthTemp * static_cast<int>(sizeof(float)) : descWidthTemp;
+      const double matchThresholdTemp = dlModeTemp
+          ? (1.0 - static_cast<double>(params.frontend.dl_match_threshold))
+          : static_cast<double>(briskMatchingThreshold_);
       std::vector<size_t> k1s;
       k1s.reserve(k1Size);
-      cv::Mat desc1(k1Size, 48, CV_8UC1);
+      cv::Mat desc1(k1Size, descWidthTemp, descTypeTemp);
       for(size_t k1 = 0; k1 < k1Size; ++k1) {
         const uint64_t id1 = multiFrame1->landmarkId(im, k1);
         if(id1) {
           continue; // already matched
         }
         std::memcpy(
-            desc1.data+48*k1s.size(),
-            multiFrame1->keypointDescriptor(im, k1), 48);
+            desc1.data + static_cast<size_t>(descBytesTemp) * k1s.size(),
+            multiFrame1->keypointDescriptor(im, k1),
+            static_cast<size_t>(descBytesTemp));
         k1s.push_back(k1);
       }
-      desc1 = desc1(cv::Rect(0,0,48,k1s.size()));
+      desc1 = desc1(cv::Rect(0, 0, descWidthTemp, static_cast<int>(k1s.size())));
 
       AlignedVector<MatchInfo> matchInfos(k0Size);
 
-      // vector container stores threads
-      std::vector<std::thread> workers;
-      for (size_t t = 0; t < size_t(params.frontend.num_matching_threads); t++) {
-        workers.push_back(std::thread([this, t, k0Size, im, &multiFrame0, &estimator, f0, k1s,
-                                      &T_WC0, &T_WC1, &multiFrame1, &olderFrameId, &matchInfos,
-                                       &params, &camera, desc1]() {
-          for(size_t k0 = t; k0 < k0Size; k0 += size_t(params.frontend.num_matching_threads)) {
-            uint64_t id0 = multiFrame0->landmarkId(im, k0);
-            if(id0) {
-              if(!estimator.isLandmarkAdded(LandmarkId(id0))) {
-                continue; // weird
+#ifdef OKVIS_USE_DL_FEATURES
+      if (dlModeTemp) {
+        // --- LightGlue path ---
+        // Build compact k0 list: unmatched, unobserved candidates
+        std::vector<size_t>       k0Indices;
+        std::vector<cv::Point2f>  kpts0lg;
+        k0Indices.reserve(k0Size);
+        kpts0lg.reserve(k0Size);
+        for (size_t k0 = 0; k0 < k0Size; ++k0) {
+          uint64_t id0 = multiFrame0->landmarkId(im, k0);
+          if (id0) {
+            if (!estimator.isLandmarkAdded(LandmarkId(id0))) continue;
+            if (estimator.isLandmarkInitialised(LandmarkId(id0))) continue;
+          }
+          if (estimator.isObserved(KeypointIdentifier{olderFrameId.value(), im, k0})) continue;
+          cv::KeyPoint kp;
+          multiFrame0->getCvKeypoint(im, k0, kp);
+          kpts0lg.push_back(kp.pt);
+          k0Indices.push_back(k0);
+        }
+
+        cv::Mat desc0mat(static_cast<int>(k0Indices.size()), descWidthTemp, CV_32F);
+        for (size_t i = 0; i < k0Indices.size(); ++i) {
+          std::memcpy(desc0mat.ptr<float>(static_cast<int>(i)),
+                      multiFrame0->keypointDescriptor(im, k0Indices[i]),
+                      static_cast<size_t>(descWidthTemp) * sizeof(float));
+        }
+
+        // Build kpts1lg from k1s
+        std::vector<cv::Point2f> kpts1lg;
+        kpts1lg.reserve(k1s.size());
+        for (size_t kk = 0; kk < k1s.size(); ++kk) {
+          cv::KeyPoint kp;
+          multiFrame1->getCvKeypoint(im, k1s[kk], kp);
+          kpts1lg.push_back(kp.pt);
+        }
+        // desc1 already holds the k1s descriptors as CV_32F [k1s.size(), descWidthTemp]
+
+        // Run LightGlue
+        std::vector<cv::DMatch> lgMatches;
+        std::vector<float>      lgScores;
+        if (!k0Indices.empty() && !k1s.empty()) {
+          std::lock_guard<std::mutex> dlLock(dlMutex_);
+          dlMatcher_->match(kpts0lg, kpts1lg, desc0mat, desc1,
+                            multiFrame0->image(im).rows, multiFrame0->image(im).cols,
+                            multiFrame1->image(im).rows, multiFrame1->image(im).cols,
+                            lgMatches, lgScores);
+        }
+
+        // Triangulate each LightGlue match and populate matchInfos
+        for (const auto& lm : lgMatches) {
+          const size_t k0 = k0Indices[static_cast<size_t>(lm.queryIdx)];
+          const size_t k1 = k1s[static_cast<size_t>(lm.trainIdx)];
+
+          double size0;
+          multiFrame0->getKeypointSize(im, k0, size0);
+          const double sigma = size0 / f0 * 0.125;
+
+          Eigen::Vector3d e0_C, e1_C;
+          if (!multiFrame0->getBackProjection(im, k0, e0_C)) continue;
+          if (!multiFrame1->getBackProjection(im, k1, e1_C)) continue;
+          const Eigen::Vector3d e0_W = (T_WC0.C() * e0_C).normalized();
+          const Eigen::Vector3d e1_W = (T_WC1.C() * e1_C).normalized();
+          if (e0_W.dot(e1_W) < 0.5) continue;
+
+          bool isValid = false, isParallel = false;
+          Eigen::Vector4d hp_W = triangulation::triangulateFast(
+              T_WC0.r(), e0_W, T_WC1.r(), e1_W, sigma, isValid, isParallel);
+          if (!isValid) continue;
+
+          const Eigen::Vector4d hp_C0 = T_WC0.inverse() * hp_W;
+          const Eigen::Vector4d hp_C1 = T_WC1.inverse() * hp_W;
+          if (e0_W.transpose() * e1_W < 0.8) continue;
+          hp_W = hp_W / hp_W[3];
+          if (hp_C0[2] / hp_C0[3] < 0.2) continue;
+          if (hp_C1[2] / hp_C1[3] < 0.2) continue;
+
+          const double quality = acos((hp_W.head<3>() - T_WC0.r()).normalized()
+                                      .dot((hp_W.head<3>() - T_WC1.r()).normalized()));
+          Eigen::Vector2d pt1, pt1p;
+          multiFrame1->getKeypoint(im, k1, pt1);
+          auto s1 = camera->projectHomogeneous(T_WC1.inverse() * hp_W, &pt1p);
+          if (s1 == cameras::ProjectionStatus::Successful && (pt1 - pt1p).norm() < 4.0) {
+            matchInfos[k0] = MatchInfo{hp_W, k1, true, !isParallel, quality};
+          }
+        }
+      } else
+#endif
+      {
+        // --- BRISK thread-parallel path ---
+        std::vector<std::thread> workers;
+        for (size_t t = 0; t < size_t(params.frontend.num_matching_threads); t++) {
+          workers.push_back(std::thread([this, t, k0Size, im, &multiFrame0, &estimator, f0, k1s,
+                                        &T_WC0, &T_WC1, &multiFrame1, &olderFrameId, &matchInfos,
+                                        &params, &camera, desc1,
+                                        descBytesTemp, descWidthTemp, matchThresholdTemp]() {
+            for(size_t k0 = t; k0 < k0Size; k0 += size_t(params.frontend.num_matching_threads)) {
+              uint64_t id0 = multiFrame0->landmarkId(im, k0);
+              if(id0) {
+                if(!estimator.isLandmarkAdded(LandmarkId(id0))) {
+                  continue; // weird
+                }
+                if(estimator.isLandmarkInitialised(LandmarkId(id0))) {
+                  continue; // already matched
+                }
               }
-              if(estimator.isLandmarkInitialised(LandmarkId(id0))) {
+
+              double distances = matchThresholdTemp;
+              bool initialisable = false;
+              double quality = 0.0;
+              Eigen::Vector4d hps_W(0,0,0,0);
+              size_t k1_max=1000;
+
+              // pre-fetch frame 0 stuff
+              const uchar* d0 = multiFrame0->keypointDescriptor(im, k0);
+              double size0;
+              multiFrame0->getKeypointSize(im, k0, size0);
+              Eigen::Vector3d e0_C;
+              if(!multiFrame0->getBackProjection(im, k0, e0_C)) continue;
+              const Eigen::Vector3d e0_W = (T_WC0.C()*e0_C).normalized();
+              const double sigma = size0/f0 * 0.125;
+
+              if(estimator.isObserved(KeypointIdentifier{olderFrameId.value(), im, k0})) {
                 continue; // already matched
               }
-            }
 
-            uint32_t distances = briskMatchingThreshold_;
-            bool initialisable = false;
-            double quality = 0.0;
-            Eigen::Vector4d hps_W(0,0,0,0);
-            size_t k1_max=1000;
+              for(size_t kk = 0; kk < k1s.size(); ++kk) {
+                const size_t k1 = k1s[kk];
+                double dist = static_cast<double>(brisk::Hamming::PopcntofXORed(
+                    d0, desc1.data + kk * descBytesTemp, 3));
 
-            // pre-fetch frame 0 stuff
-            const uchar* d0 = multiFrame0->keypointDescriptor(im, k0);
-            double size0;
-            multiFrame0->getKeypointSize(im, k0, size0);
-            Eigen::Vector2d pt0;
-            multiFrame0->getKeypoint(im, k0, pt0);
-            Eigen::Vector3d e0_C;
-            if(!multiFrame0->getBackProjection(im, k0, e0_C)) continue;
-            const Eigen::Vector3d e0_W = (T_WC0.C()*e0_C).normalized();
-            const double sigma = size0/f0 * 0.125;
+                if(dist < distances) {
+                  // it's a match! triangulate
+                  bool isValid = false;
+                  bool isParallel = false;
+                  Eigen::Vector3d e1_C;
+                  if(!multiFrame1->getBackProjection(im, k1, e1_C)) continue;
+                  const Eigen::Vector3d e1_W = (T_WC1.C()*e1_C).normalized();
+                  if(e0_W.dot(e1_W) < 0.5) continue;
 
-            if(estimator.isObserved(KeypointIdentifier{olderFrameId.value(), im, k0})) {
-              continue; // already matched
-            }
+                  Eigen::Vector4d hp_W = triangulation::triangulateFast(
+                        T_WC0.r(), e0_W, T_WC1.r(), e1_W, sigma, isValid, isParallel);
+                  if(!isValid) continue;
 
-            for(size_t kk = 0; kk < k1s.size(); ++kk) {
-              const size_t k1 = k1s[kk];
-              const uint32_t dist = brisk::Hamming::PopcntofXORed(
-                  d0, desc1.data+kk*48, 3);
-              if(dist < distances) {
-                // it's a match!
+                  const Eigen::Vector4d hp_C0 = (T_WC0.inverse()*hp_W);
+                  const Eigen::Vector4d hp_C1 = (T_WC1.inverse()*hp_W);
+                  if(e0_W.transpose()*e1_W < 0.8) isValid = false;
+                  hp_W = hp_W/hp_W[3];
+                  if(hp_C0[2]/hp_C0[3] < 0.2) isValid = false;
+                  if(hp_C1[2]/hp_C1[3] < 0.2) isValid = false;
 
-                // triangulate
-                bool isValid = false;
-                bool isParallel = false;
-                Eigen::Vector3d e1_C;
-                if(!multiFrame1->getBackProjection(im, k1, e1_C)) continue;
-                const Eigen::Vector3d e1_W = (T_WC1.C()*e1_C).normalized();
-                if(e0_W.dot(e1_W) < 0.5) continue;
-
-                Eigen::Vector4d hp_W = triangulation::triangulateFast(
-                      T_WC0.r(), e0_W, T_WC1.r(), e1_W, sigma, isValid, isParallel);
-
-                if(!isValid) {
-                  continue;
+                  if(isValid) {
+                    k1_max = k1;
+                    distances = dist;
+                    quality = acos((hp_W.head<3>()-T_WC0.r()).normalized()
+                                   .dot((hp_W.head<3>()-T_WC1.r()).normalized()));
+                    hps_W = hp_W;
+                    initialisable = !isParallel;
+                  }
                 }
+              }
 
-                // check if too close (out of focus)
-                const Eigen::Vector4d hp_C0 = (T_WC0.inverse()*hp_W);
-                const Eigen::Vector4d hp_C1 = (T_WC1.inverse()*hp_W);
-
-                if(e0_W.transpose()*e1_W < 0.8) {
-                  isValid = false;
-                }
-
-                hp_W = hp_W/hp_W[3];
-                if(hp_C0[2]/hp_C0[3] < 0.2) {
-                  isValid = false;
-                }
-                if(hp_C1[2]/hp_C1[3] < 0.2) {
-                  isValid = false;
-                }
-
-                // remember
-                if(/*dist<distances && */isValid) {
-                  k1_max = k1;
-                  distances=dist;
-                  quality = acos((hp_W.head<3>()-T_WC0.r()).normalized()
-                                 .dot((hp_W.head<3>()-T_WC1.r()).normalized()));
-                  hps_W = hp_W;
-                  initialisable = !isParallel;
+              if(distances < matchThresholdTemp) {
+                Eigen::Vector2d pt1p;
+                Eigen::Vector2d pt1;
+                multiFrame1->getKeypoint(im, k1_max, pt1);
+                auto s1 = camera->projectHomogeneous(T_WC1.inverse()*hps_W, &pt1p);
+                if(s1 == cameras::ProjectionStatus::Successful && (pt1-pt1p).norm()<4.0) {
+                  matchInfos[k0] = MatchInfo{hps_W, k1_max, true, initialisable, quality};
                 }
               }
             }
+          }));
+        }
 
-            // add observations and initialise
-            if(distances < briskMatchingThreshold_) {
-              Eigen::Vector2d pt1p;
-              Eigen::Vector2d pt1;
-              multiFrame1->getKeypoint(im, k1_max, pt1);
-              auto s1 = camera->projectHomogeneous(T_WC1.inverse()*hps_W, &pt1p);
-              if(s1 == cameras::ProjectionStatus::Successful && (pt1-pt1p).norm()<4.0) {
-                matchInfos[k0] = MatchInfo{hps_W, k1_max, true, initialisable, quality};
-              }
-            }
-          }
-        }));
+        // join all matcher threads
+        std::for_each(workers.begin(), workers.end(), [](std::thread &worker) {
+            worker.join();
+        });
       }
-
-      // join all matcher threads
-      std::for_each(workers.begin(), workers.end(), [](std::thread &worker) {
-          worker.join();
-      });
 
       // finally insert the actual matches
       for(size_t k0=0; k0<k0Size; ++k0) {
@@ -2219,17 +2609,149 @@ void Frontend::matchStereo(Estimator &estimator, std::shared_ptr<okvis::MultiFra
         const auto camera1 = multiFrame->geometryAs<CAMERA_GEOMETRY>(im1);
         const double f0 = 0.5* (camera0->focalLengthU() + camera0->focalLengthV());
         const double f1 = 0.5* (camera1->focalLengthU() + camera1->focalLengthV());
+        const bool dlModeStereo = (k0Size > 0 && multiFrame->descriptorType(im0) == CV_32F);
+        const int descWidthStereo = dlModeStereo ? 256 : 48;
+        const int descBytesStereo = dlModeStereo
+            ? descWidthStereo * static_cast<int>(sizeof(float)) : descWidthStereo;
+        const double matchThresholdStereo = dlModeStereo
+            ? (1.0 - static_cast<double>(params.frontend.dl_match_threshold))
+            : static_cast<double>(briskMatchingThreshold_);
+#ifdef OKVIS_USE_DL_FEATURES
+        if (dlModeStereo) {
+          // --- LightGlue path: one batch inference call for the whole stereo pair ---
+          std::vector<cv::Point2f> kpts0, kpts1;
+          kpts0.reserve(k0Size);
+          kpts1.reserve(k1Size);
+          cv::Mat desc0mat(static_cast<int>(k0Size), descWidthStereo, CV_32F);
+          cv::Mat desc1mat(static_cast<int>(k1Size), descWidthStereo, CV_32F);
+          for (size_t k = 0; k < k0Size; ++k) {
+            cv::KeyPoint kp;
+            multiFrame->getCvKeypoint(im0, k, kp);
+            kpts0.push_back(kp.pt);
+            std::memcpy(desc0mat.ptr<float>(static_cast<int>(k)),
+                        multiFrame->keypointDescriptor(im0, k),
+                        static_cast<size_t>(descWidthStereo) * sizeof(float));
+          }
+          for (size_t k = 0; k < k1Size; ++k) {
+            cv::KeyPoint kp;
+            multiFrame->getCvKeypoint(im1, k, kp);
+            kpts1.push_back(kp.pt);
+            std::memcpy(desc1mat.ptr<float>(static_cast<int>(k)),
+                        multiFrame->keypointDescriptor(im1, k),
+                        static_cast<size_t>(descWidthStereo) * sizeof(float));
+          }
+          std::vector<cv::DMatch> lgMatches;
+          std::vector<float>      lgScores;
+          {
+            std::lock_guard<std::mutex> dlLock(dlMutex_);
+            dlMatcher_->match(kpts0, kpts1, desc0mat, desc1mat,
+                              multiFrame->image(im0).rows, multiFrame->image(im0).cols,
+                              multiFrame->image(im1).rows, multiFrame->image(im1).cols,
+                              lgMatches, lgScores);
+          }
+          // Triangulate and insert observations for each LightGlue match
+          for (size_t mi = 0; mi < lgMatches.size(); ++mi) {
+            const size_t k0 = static_cast<size_t>(lgMatches[mi].queryIdx);
+            const size_t k1 = static_cast<size_t>(lgMatches[mi].trainIdx);
+            if (k0 >= k0Size || k1 >= k1Size) continue;
+
+            double size0, size1;
+            multiFrame->getKeypointSize(im0, k0, size0);
+            multiFrame->getKeypointSize(im1, k1, size1);
+            Eigen::Vector2d pt0, pt1;
+            multiFrame->getKeypoint(im0, k0, pt0);
+            multiFrame->getKeypoint(im1, k1, pt1);
+            const double sigma = std::max(size0/f0, size1/f1) * 0.125;
+
+            bool isValid = false;
+            bool isParallel = false;
+            Eigen::Vector3d e0_C, e1_C;
+            if (!multiFrame->getBackProjection(im0, k0, e0_C)) continue;
+            if (!multiFrame->getBackProjection(im1, k1, e1_C)) continue;
+            Eigen::Vector3d e0_W = (T_WC0.C()*e0_C).normalized();
+            Eigen::Vector3d e1_W = (T_WC1.C()*e1_C).normalized();
+            Eigen::Vector4d hp_W = triangulation::triangulateFast(
+                T_WC0.r(), e0_W, T_WC1.r(), e1_W, sigma, isValid, isParallel);
+
+            const Eigen::Vector4d hp_C0 = (T_WC0.inverse()*hp_W);
+            const Eigen::Vector4d hp_C1 = (T_WC1.inverse()*hp_W);
+            hp_W = hp_W/hp_W[3];
+            if (hp_C0[2]/hp_C0[3] < 0.1) isValid = false;
+            if (hp_C1[2]/hp_C1[3] < 0.1) isValid = false;
+            if (e0_W.transpose()*e1_W < 0.8) isValid = false;
+            if (!isValid) continue;
+
+            const bool initialisable = !isParallel;
+            const Eigen::Vector4d hps_W = hp_W;
+
+            uint64_t lmId = 0;
+            const uint64_t id0 = multiFrame->landmarkId(im0, k0);
+            uint64_t id1 = multiFrame->landmarkId(im1, k1);
+            bool add0 = false;
+            bool add1 = false;
+            if (id0 && id1) {
+              if (id0 != id1) {
+                estimator.mergeLandmark(LandmarkId(id1), LandmarkId(id0));
+                id1 = id0;
+              }
+              if (!estimator.isLandmarkInitialised(LandmarkId(id0))) {
+                if (initialisable) {
+                  estimator.setLandmark(LandmarkId(id0), hps_W, true);
+                }
+              }
+            } else if (id1) {
+              lmId = id1;
+              add0 = true;
+            } else if (id0) {
+              lmId = id0;
+              add1 = true;
+            } else {
+              if (!asKeyframe) continue;
+              add0 = true;
+              add1 = true;
+              lmId = estimator.addLandmark(hps_W, initialisable).value();
+              OKVIS_ASSERT_TRUE_DBG(Exception, estimator.isLandmarkAdded(LandmarkId(lmId)),
+                                    lmId << " not added, bug")
+            }
+            if (add0) {
+              Eigen::Vector2d pt0p;
+              MapPoint2 mapPoint;
+              estimator.getLandmark(LandmarkId(lmId), mapPoint);
+              Eigen::Vector4d hp_eff_W = mapPoint.point;
+              auto s0 = camera0->projectHomogeneous(T_WC0.inverse()*hp_eff_W, &pt0p);
+              if (s0 == cameras::ProjectionStatus::Successful && (pt0-pt0p).norm()<4.0) {
+                multiFrame->setLandmarkId(im0, k0, lmId);
+                estimator.addObservation<CAMERA_GEOMETRY>(LandmarkId(lmId), StateId(mfId), im0, k0);
+              }
+            }
+            if (add1) {
+              Eigen::Vector2d pt1p;
+              MapPoint2 mapPoint;
+              estimator.getLandmark(LandmarkId(lmId), mapPoint);
+              Eigen::Vector4d hp_eff_W = mapPoint.point;
+              auto s1 = camera1->projectHomogeneous(T_WC1.inverse()*hp_eff_W, &pt1p);
+              if (s1 == cameras::ProjectionStatus::Successful && (pt1-pt1p).norm()<4.0) {
+                multiFrame->setLandmarkId(im1, k1, lmId);
+                estimator.addObservation<CAMERA_GEOMETRY>(LandmarkId(lmId), StateId(mfId), im1, k1);
+              }
+            }
+          }
+        } else
+#endif  // OKVIS_USE_DL_FEATURES
+        {  // BRISK brute-force path
+        (void)descBytesStereo;
         for(size_t k0 = 0; k0 < k0Size; ++k0) {
 
-          double distances = briskMatchingThreshold_;
+          double distances = matchThresholdStereo;
           bool initialisable=  false;
           Eigen::Vector4d hps_W;
           size_t k1_match = 0;
 
+          const uchar* d0 = multiFrame->keypointDescriptor(im0, k0);
           for(size_t k1 = 0; k1 < k1Size; ++k1) {
-            const auto dist = brisk::Hamming::PopcntofXORed(
-                multiFrame->keypointDescriptor(im0, k0),
-                  multiFrame->keypointDescriptor(im1, k1), 3);
+            double dist;
+            dist = static_cast<double>(brisk::Hamming::PopcntofXORed(
+                d0, multiFrame->keypointDescriptor(im1, k1), 3));
             if(dist < distances) {
               // it's a match!
               double size0, size1;
@@ -2278,7 +2800,7 @@ void Frontend::matchStereo(Estimator &estimator, std::shared_ptr<okvis::MultiFra
             }
           }
 
-          if(distances<briskMatchingThreshold_) {
+          if(distances<matchThresholdStereo) {
             Eigen::Vector2d pt0, pt1;
             multiFrame->getKeypoint(im0, k0, pt0);
             multiFrame->getKeypoint(im1, k1_match, pt1);
@@ -2349,6 +2871,7 @@ void Frontend::matchStereo(Estimator &estimator, std::shared_ptr<okvis::MultiFra
             }
           }
         }
+        }  // end BRISK path
       }
     }
   }

@@ -264,10 +264,18 @@ const unsigned char * Frame::keypointDescriptor(size_t keypointIdx) const
       Exception,
       keypointIdx < keypoints_.size(),
       "keypointIdx " << keypointIdx << "out of range: keypoints has size "<< keypoints_.size())
-  return descriptors_.data + size_t(descriptors_.cols) * keypointIdx;
+  // Use step[0] (bytes per row) so this works for both CV_8U (BRISK, 1 byte/elem)
+  // and CV_32F (SuperPoint/DISK, 4 bytes/elem) descriptors.
+  return descriptors_.data + descriptors_.step[0] * keypointIdx;
 #else
-  return descriptors_.data + size_t(descriptors_.cols) * keypointIdx;
+  return descriptors_.data + descriptors_.step[0] * keypointIdx;
 #endif
+}
+
+// Returns the OpenCV depth type of the stored descriptors.
+int Frame::descriptorType() const
+{
+  return descriptors_.type();
 }
 
 // Set the landmark ID

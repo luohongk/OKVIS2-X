@@ -314,6 +314,22 @@ void ViParametersReader::readConfigFile(const std::string& filename) {
   parseEntry(file["frontend_parameters"], "num_matching_threads",
              viParameters_.frontend.num_matching_threads);
 
+  // Deep-learning feature parameters (optional – defaults set in struct)
+  parseEntry(file["frontend_parameters"], "use_dl_features",
+             viParameters_.frontend.use_dl_features);
+  parseEntry(file["frontend_parameters"], "dl_extractor_type",
+             viParameters_.frontend.dl_extractor_type);
+  parseEntry(file["frontend_parameters"], "dl_extractor_path",
+             viParameters_.frontend.dl_extractor_path);
+  parseEntry(file["frontend_parameters"], "dl_matcher_path",
+             viParameters_.frontend.dl_matcher_path);
+  parseEntry(file["frontend_parameters"], "dl_match_threshold",
+             viParameters_.frontend.dl_match_threshold);
+  parseEntry(file["frontend_parameters"], "dl_image_size",
+             viParameters_.frontend.dl_image_size);
+  parseEntry(file["frontend_parameters"], "dl_use_gpu",
+             viParameters_.frontend.dl_use_gpu);
+
   // Parameters regarding the estimator.
   parseEntry(file["estimator_parameters"], "num_keyframes",
              viParameters_.estimator.num_keyframes);

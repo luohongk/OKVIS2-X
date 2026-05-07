@@ -253,6 +253,13 @@ const unsigned char * MultiFrame::keypointDescriptor(size_t cameraIdx,
   return frames_[cameraIdx].keypointDescriptor(keypointIdx);
 }
 
+// Returns the OpenCV depth type of the stored descriptors for a camera.
+int MultiFrame::descriptorType(size_t cameraIdx) const
+{
+  OKVIS_ASSERT_TRUE_DBG(Exception, cameraIdx < frames_.size(), "Out of range")
+  return frames_[cameraIdx].descriptorType();
+}
+
 // Set the landmark ID
 bool MultiFrame::setLandmarkId(size_t cameraIdx, size_t keypointIdx,
                                uint64_t landmarkId)
