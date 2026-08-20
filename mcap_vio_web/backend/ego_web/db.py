@@ -164,6 +164,28 @@ class Database:
             ).fetchone()
         return dict(row) if row is not None else None
 
+    def delete_task(self, task_id: str) -> bool:
+        with self.connect() as connection:
+            with connection:
+                row = connection.execute(
+                    "SELECT group_id FROM tasks WHERE id = ?", (task_id,)
+                ).fetchone()
+                if row is None:
+                    return False
+                group_id = str(row["group_id"])
+                connection.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+                connection.execute(
+                    """
+                    DELETE FROM task_groups
+                    WHERE id = ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM tasks WHERE group_id = task_groups.id
+                      )
+                    """,
+                    (group_id,),
+                )
+                return True
+
     def list_task_groups(
         self,
         *,

@@ -16,7 +16,10 @@ class TaskRunner(Protocol):
         self,
         task: dict[str, Any],
         on_stage: Callable[[str], None],
+        cancel_event: threading.Event,
     ) -> RunnerResult: ...
+
+    def terminate_task(self, task_id: str) -> None: ...
 
     def terminate_all(self) -> None: ...
 
@@ -43,10 +46,12 @@ class Scheduler:
         self._queue: queue.Queue[tuple[int, str] | None] = queue.Queue()
         self._workers: list[threading.Thread] = []
         self._state_lock = threading.Lock()
+        self._lifecycle_condition = threading.Condition(self._state_lock)
         self._launch_condition = threading.Condition()
         self._next_ticket = 0
         self._ticket_counter = 0
         self._running_ids: set[str] = set()
+        self._cancel_events: dict[str, threading.Event] = {}
         self._stopping = threading.Event()
         self._started_once = False
         self.accepting_tasks = False
@@ -95,6 +100,7 @@ class Scheduler:
                 stopped = False
                 with self._launch_condition:
                     for task_id in validated:
+                        self._cancel_events.setdefault(task_id, threading.Event())
                         self._queue.put((self._ticket_counter, task_id))
                         self._ticket_counter += 1
         if stopped:
@@ -119,6 +125,36 @@ class Scheduler:
                 self._queue.all_tasks_done.wait(remaining)
         return True
 
+    def cancel_and_wait(self, task_id: str, timeout: float) -> None:
+        deadline = time.monotonic() + timeout
+        with self._state_lock:
+            cancel_event = self._cancel_events.setdefault(task_id, threading.Event())
+            cancel_event.set()
+            wait_for_running = task_id in self._running_ids
+
+        task = self.database.get_task(task_id)
+        if task is not None and task["status"] not in TERMINAL_STATUSES:
+            try:
+                self.database.transition_task(
+                    task_id,
+                    "interrupted",
+                    finished_at=self.now_factory(),
+                    error_summary="task cancellation requested",
+                )
+            except InvalidStatusTransition:
+                pass
+
+        self.runner.terminate_task(task_id)
+        if not wait_for_running:
+            return
+
+        with self._lifecycle_condition:
+            while task_id in self._running_ids:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"task {task_id} did not stop before timeout")
+                self._lifecycle_condition.wait(remaining)
+
     def stop(self) -> None:
         with self._state_lock:
             if not self._workers:
@@ -126,6 +162,8 @@ class Scheduler:
                 return
             self.accepting_tasks = False
             self._stopping.set()
+            for cancel_event in self._cancel_events.values():
+                cancel_event.set()
             workers = list(self._workers)
         with self._launch_condition:
             self._launch_condition.notify_all()
@@ -208,6 +246,9 @@ class Scheduler:
             if task is None or task["status"] != "queued":
                 return
             with self._state_lock:
+                cancel_event = self._cancel_events.setdefault(task_id, threading.Event())
+                if cancel_event.is_set():
+                    return
                 self._running_ids.add(task_id)
                 running_registered = True
             self.database.transition_task(
@@ -226,15 +267,17 @@ class Scheduler:
                     launch_released = True
                 self._record_stage(task_id, stage)
 
-            result = self.runner.run(task, on_stage)
+            result = self.runner.run(task, on_stage, cancel_event)
             self._record_result(task_id, result)
         except Exception as exc:
             self._record_exception(task_id, exc)
         finally:
             self._retire_ticket(ticket)
-            if running_registered:
-                with self._state_lock:
+            with self._lifecycle_condition:
+                if running_registered:
                     self._running_ids.discard(task_id)
+                    self._lifecycle_condition.notify_all()
+                self._cancel_events.pop(task_id, None)
 
     def _wait_for_launch_turn(self, ticket: int) -> bool:
         with self._launch_condition:

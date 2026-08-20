@@ -2,6 +2,7 @@ import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { taskApi } from '../api'
 import { TaskLog } from '../components/TaskLog'
 import type { Task } from '../types'
 import { TasksPage } from './TasksPage'
@@ -59,12 +60,20 @@ const tasks = {
   ],
 }
 
-function response(body: unknown, status = 200): Promise<Response> {
+function response(body: unknown, status = 200, json = vi.fn(async () => body)): Promise<Response> {
   return Promise.resolve({
     ok: status >= 200 && status < 300,
     status,
-    json: async () => body,
-  } as Response)
+    json,
+  } as unknown as Response)
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise
+  })
+  return { promise, resolve }
 }
 
 class FakeEventSource {
@@ -97,13 +106,15 @@ class FakeEventSource {
 }
 
 function installFetch() {
-  return vi.spyOn(globalThis, 'fetch').mockImplementation((input) => {
+  return vi.spyOn(globalThis, 'fetch').mockImplementation((input, init) => {
     const url = String(input)
-    if (url.startsWith('/api/v1/tasks')) return response(tasks)
-    if (url === '/api/v1/runtime') {
+    const method = init?.method ?? 'GET'
+    if (method === 'DELETE' && url.startsWith('/api/v1/tasks/')) return response(undefined, 204)
+    if (method === 'GET' && url.startsWith('/api/v1/tasks')) return response(tasks)
+    if (method === 'GET' && url === '/api/v1/runtime') {
       return response({ max_concurrency: 2, running: 1, queued: 3, accepting_tasks: true })
     }
-    throw new Error(`Unexpected request: ${url}`)
+    throw new Error(`Unexpected request: ${method} ${url}`)
   })
 }
 
@@ -112,6 +123,7 @@ let fetchMock: ReturnType<typeof installFetch>
 beforeEach(() => {
   FakeEventSource.instances = []
   vi.stubGlobal('EventSource', FakeEventSource)
+  vi.stubGlobal('confirm', vi.fn(() => true))
   fetchMock = installFetch()
 })
 
@@ -132,7 +144,7 @@ describe('TasksPage', () => {
   it('renders tasks, statuses, runtime summary, result link, and failure details', async () => {
     renderPage()
 
-    const running = await screen.findByRole('button', { name: /20260805-113804/ })
+    const running = await screen.findByRole('button', { name: '选择 20260805-113804' })
     expect(within(running).getByText('抽取中')).toBeInTheDocument()
     const runtime = screen.getByRole('region', { name: '队列运行摘要' })
     expect(runtime).toHaveTextContent('2 路并发')
@@ -166,7 +178,7 @@ describe('TasksPage', () => {
   it('opens one event stream and applies snapshot, log, status, and terminal events', async () => {
     const user = userEvent.setup()
     renderPage()
-    await user.click(await screen.findByRole('button', { name: /20260805-113804/ }))
+    await user.click(await screen.findByRole('button', { name: '选择 20260805-113804' }))
 
     expect(FakeEventSource.instances).toHaveLength(1)
     const stream = FakeEventSource.instances[0]
@@ -188,12 +200,12 @@ describe('TasksPage', () => {
   it('closes the previous stream when switching task and on unmount', async () => {
     const user = userEvent.setup()
     const rendered = renderPage()
-    await user.click(await screen.findByRole('button', { name: /20260805-113804/ }))
+    await user.click(await screen.findByRole('button', { name: '选择 20260805-113804' }))
     const first = FakeEventSource.instances[0]
-    const firstButton = screen.getByRole('button', { name: /20260805-113804/ })
+    const firstButton = screen.getByRole('button', { name: '选择 20260805-113804' })
     expect(firstButton).toHaveAttribute('aria-pressed', 'true')
 
-    await user.click(screen.getByRole('button', { name: /failed-sequence/ }))
+    await user.click(screen.getByRole('button', { name: '选择 failed-sequence' }))
     expect(first.closed).toBe(true)
     expect(firstButton).toHaveAttribute('aria-pressed', 'false')
     expect(FakeEventSource.instances).toHaveLength(2)
@@ -239,6 +251,144 @@ describe('TasksPage', () => {
     expect(screen.getByText(/日志连接暂时中断/)).toBeInTheDocument()
     act(() => stream.onopen?.())
     expect(screen.queryByText(/日志连接暂时中断/)).not.toBeInTheDocument()
+  })
+
+  it('does not request deletion when confirmation is declined', async () => {
+    const user = userEvent.setup()
+    vi.mocked(window.confirm).mockReturnValue(false)
+    renderPage()
+
+    await user.click(await screen.findByRole('button', { name: '删除 20260805-113804' }))
+
+    expect(window.confirm).toHaveBeenCalledWith(expect.stringMatching(/活动任务.*先取消[\s\S]*日志.*EuRoC 中间数据.*结果.*记录.*永久删除.*不可恢复/))
+    expect(fetchMock.mock.calls.some(([, init]) => init?.method === 'DELETE')).toBe(false)
+  })
+
+  it('sends an encoded DELETE request and does not parse a 204 response', async () => {
+    const json = vi.fn()
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input)
+      const method = init?.method ?? 'GET'
+      if (method === 'DELETE') return response(undefined, 204, json)
+      if (url.startsWith('/api/v1/tasks')) return response(tasks)
+      return response({ max_concurrency: 2, running: 1, queued: 3, accepting_tasks: true })
+    })
+
+    await taskApi.remove('task/id with space')
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/tasks/task%2Fid%20with%20space',
+      expect.objectContaining({ method: 'DELETE' }),
+    )
+    expect(json).not.toHaveBeenCalled()
+  })
+
+  it('keeps the card visible and disables all delete actions while deleting, then removes it on success', async () => {
+    const user = userEvent.setup()
+    const deletion = deferred<Response>()
+    let listRequestCount = 0
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input)
+      const method = init?.method ?? 'GET'
+      if (method === 'DELETE') return deletion.promise
+      if (url.startsWith('/api/v1/tasks')) {
+        listRequestCount += 1
+        return response(tasks)
+      }
+      return response({ max_concurrency: 2, running: 1, queued: 3, accepting_tasks: true })
+    })
+    renderPage()
+
+    await user.click(await screen.findByRole('button', { name: '删除 20260805-113804' }))
+
+    expect(screen.getByRole('button', { name: '删除中…' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: '删除 20260805-114500' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: '删除 failed-sequence' })).toBeDisabled()
+
+    await user.selectOptions(screen.getByRole('combobox', { name: '任务状态' }), 'extracting')
+    await user.click(screen.getByRole('button', { name: '应用过滤' }))
+    await waitFor(() => expect(listRequestCount).toBe(2))
+    expect(screen.getByRole('button', { name: '删除中…' })).toBeDisabled()
+    expect(screen.getByText('20260805-113804')).toBeInTheDocument()
+
+    deletion.resolve(await response(undefined, 204))
+
+    await waitFor(() => expect(screen.queryByText('20260805-113804')).not.toBeInTheDocument())
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'DELETE')).toHaveLength(1)
+    expect(fetchMock.mock.calls.filter(([input, init]) => String(input).startsWith('/api/v1/tasks?') && !init?.method).length).toBeGreaterThan(1)
+    expect(fetchMock.mock.calls.filter(([input]) => String(input) === '/api/v1/runtime').length).toBeGreaterThan(1)
+  })
+
+  it('closes the selected task event stream before sending DELETE', async () => {
+    const user = userEvent.setup()
+    let streamWasClosed = false
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input)
+      const method = init?.method ?? 'GET'
+      if (method === 'DELETE') {
+        streamWasClosed = FakeEventSource.instances[0]?.closed ?? false
+        return response(undefined, 204)
+      }
+      if (url.startsWith('/api/v1/tasks')) return response(tasks)
+      return response({ max_concurrency: 2, running: 1, queued: 3, accepting_tasks: true })
+    })
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: '选择 20260805-113804' }))
+
+    await user.click(screen.getByRole('button', { name: '删除 20260805-113804' }))
+
+    expect(streamWasClosed).toBe(true)
+  })
+
+  it('reloads after a failed deletion, shows the server error, and restores actions', async () => {
+    const user = userEvent.setup()
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input)
+      const method = init?.method ?? 'GET'
+      if (method === 'DELETE') return response({ detail: '活动任务无法删除' }, 409)
+      if (url.startsWith('/api/v1/tasks')) return response(tasks)
+      return response({ max_concurrency: 2, running: 1, queued: 3, accepting_tasks: true })
+    })
+    renderPage()
+
+    await user.click(await screen.findByRole('button', { name: '删除 20260805-113804' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('活动任务无法删除')
+    expect(screen.getByRole('button', { name: '删除 20260805-113804' })).toBeEnabled()
+    expect(screen.getByText('20260805-113804')).toBeInTheDocument()
+    expect(fetchMock.mock.calls.filter(([input, init]) => String(input).startsWith('/api/v1/tasks?') && !init?.method).length).toBeGreaterThan(1)
+  })
+
+  it('does not reinsert a deleted task from a stale poll', async () => {
+    const user = userEvent.setup()
+    const staleList = deferred<Response>()
+    let listRequestCount = 0
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input)
+      const method = init?.method ?? 'GET'
+      if (method === 'DELETE') return response(undefined, 204)
+      if (url.startsWith('/api/v1/tasks?')) {
+        listRequestCount += 1
+        if (listRequestCount === 2) return staleList.promise
+        return response(tasks)
+      }
+      return response({ max_concurrency: 2, running: 1, queued: 3, accepting_tasks: true })
+    })
+    renderPage()
+    await screen.findByText('20260805-113804')
+
+    await user.selectOptions(screen.getByRole('combobox', { name: '任务状态' }), 'extracting')
+    await user.click(screen.getByRole('button', { name: '应用过滤' }))
+    await waitFor(() => expect(listRequestCount).toBe(2))
+    await user.click(screen.getByRole('button', { name: '删除 20260805-113804' }))
+    await waitFor(() => expect(screen.queryByText('20260805-113804')).not.toBeInTheDocument())
+
+    staleList.resolve(await response(tasks))
+
+    await act(async () => {
+      await staleList.promise
+    })
+    expect(screen.queryByText('20260805-113804')).not.toBeInTheDocument()
   })
 
   it('shows task loading failures', async () => {

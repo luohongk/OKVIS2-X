@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -16,7 +17,12 @@ from ego_web.settings import Settings
 
 
 class ImmediateRunner:
-    def run(self, task: dict[str, Any], on_stage: Callable[[str], None]) -> RunnerResult:
+    def run(
+        self,
+        task: dict[str, Any],
+        on_stage: Callable[[str], None],
+        cancel_event: threading.Event,
+    ) -> RunnerResult:
         return RunnerResult(0, "SUCCESS")
 
     def terminate_all(self) -> None:

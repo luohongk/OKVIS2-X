@@ -1,4 +1,5 @@
-import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react'
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { flushSync } from 'react-dom'
 import { Link } from 'react-router-dom'
 import { taskApi } from '../api'
 import { StatusBadge } from '../components/StatusBadge'
@@ -11,7 +12,9 @@ export function TasksPage() {
   const [tasks, setTasks] = useState<Task[]>([])
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null)
   const [selectedId, setSelectedId] = useState('')
+  const [deletingId, setDeletingId] = useState('')
   const [error, setError] = useState('')
+  const excludedTaskIds = useRef(new Set<string>())
   const [appliedQuery, setAppliedQuery] = useState('limit=100&offset=0')
   const [status, setStatus] = useState('')
   const [device, setDevice] = useState('')
@@ -24,7 +27,7 @@ export function TasksPage() {
         taskApi.list(appliedQuery, signal),
         taskApi.runtime(signal),
       ])
-      setTasks(taskResponse.items)
+      setTasks(taskResponse.items.filter((task) => !excludedTaskIds.current.has(task.id)))
       setRuntime(runtimeResponse)
       setError('')
     } catch (reason) {
@@ -65,6 +68,27 @@ export function TasksPage() {
     query.set('limit', '100')
     query.set('offset', '0')
     setAppliedQuery(query.toString())
+  }
+
+  const removeTask = async (task: Task) => {
+    if (deletingId || !window.confirm(
+      `确定删除任务“${task.sequence}”吗？活动任务将先取消；日志、EuRoC 中间数据、结果和记录将永久删除且不可恢复。`,
+    )) return
+
+    setDeletingId(task.id)
+    if (selectedId === task.id) flushSync(() => setSelectedId(''))
+
+    try {
+      await taskApi.remove(task.id)
+      excludedTaskIds.current.add(task.id)
+      setTasks((current) => current.filter((item) => item.id !== task.id))
+      await load()
+    } catch (reason) {
+      await load()
+      setError(reason instanceof Error ? reason.message : '任务删除失败')
+    } finally {
+      setDeletingId('')
+    }
   }
 
   return (
@@ -113,6 +137,7 @@ export function TasksPage() {
               <article key={task.id} className={selectedId === task.id ? 'task-entry is-selected' : 'task-entry'}>
                 <button
                   type="button"
+                  aria-label={`选择 ${task.sequence}`}
                   aria-pressed={selectedId === task.id}
                   onClick={() => setSelectedId(task.id)}
                 >
@@ -132,11 +157,22 @@ export function TasksPage() {
                     </div>
                   )}
                 </button>
-                {task.status === 'succeeded' && (
-                  <Link className="result-link" to={`/results/${task.id}`} aria-label={`查看 ${task.sequence} 结果`}>
-                    查看轨迹结果 →
-                  </Link>
-                )}
+                <div className="task-entry__actions">
+                  {task.status === 'succeeded' && (
+                    <Link className="result-link" to={`/results/${task.id}`} aria-label={`查看 ${task.sequence} 结果`}>
+                      查看轨迹结果 →
+                    </Link>
+                  )}
+                  <button
+                    type="button"
+                    className="danger-button"
+                    aria-label={deletingId === task.id ? '删除中…' : `删除 ${task.sequence}`}
+                    disabled={Boolean(deletingId)}
+                    onClick={() => void removeTask(task)}
+                  >
+                    {deletingId === task.id ? '删除中…' : '删除'}
+                  </button>
+                </div>
               </article>
             ))}
             {tasks.length === 0 && !error && <p className="task-empty">暂无符合条件的任务</p>}

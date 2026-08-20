@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -11,6 +12,7 @@ from typing import Any
 
 import pytest
 
+import ego_web.runner as runner_module
 from ego_web.db import Database
 from ego_web.runner import Runner, RunnerResult, build_runner_command
 from ego_web.scheduler import Scheduler
@@ -93,7 +95,7 @@ def test_runner_streams_log_reports_stages_and_requires_success_status(tmp_path:
     runner = Runner(settings, runner_script=Path(__file__).with_name("fake_runner.py"))
     stages: list[str] = []
 
-    result = runner.run(task, stages.append)
+    result = runner.run(task, stages.append, threading.Event())
 
     assert result == RunnerResult(exit_code=0, runner_status="SUCCESS", interrupted=False)
     assert stages == ["extracting", "vio"]
@@ -102,7 +104,7 @@ def test_runner_streams_log_reports_stages_and_requires_success_status(tmp_path:
     assert "[O] optimization complete" in log
 
     missing = task_details(tmp_path, "missing-status")
-    missing_result = runner.run(missing, lambda stage: None)
+    missing_result = runner.run(missing, lambda stage: None, threading.Event())
     assert missing_result.exit_code == 0
     assert missing_result.runner_status is None
     assert missing_result.succeeded is False
@@ -118,7 +120,11 @@ def test_runner_terminates_the_whole_process_group(tmp_path: Path) -> None:
 
     thread = threading.Thread(
         target=lambda: result_holder.append(
-            runner.run(task, lambda stage: started.set() if stage == "extracting" else None)
+            runner.run(
+                task,
+                lambda stage: started.set() if stage == "extracting" else None,
+                threading.Event(),
+            )
         )
     )
     thread.start()
@@ -180,7 +186,12 @@ class ControlledRunner:
         self.max_active = 0
         self.interrupted = threading.Event()
 
-    def run(self, task: dict[str, Any], on_stage: Callable[[str], None]) -> RunnerResult:
+    def run(
+        self,
+        task: dict[str, Any],
+        on_stage: Callable[[str], None],
+        cancel_event: threading.Event,
+    ) -> RunnerResult:
         with self.lock:
             self.order.append(task["sequence"])
             self.active += 1
@@ -188,7 +199,7 @@ class ControlledRunner:
         try:
             on_stage("extracting")
             time.sleep(self.delay)
-            if self.interrupted.is_set():
+            if self.interrupted.is_set() or cancel_event.is_set():
                 return RunnerResult(-15, None, interrupted=True)
             on_stage("vio")
             time.sleep(self.delay)
@@ -263,7 +274,7 @@ def test_runner_refuses_new_processes_after_termination_begins(tmp_path: Path) -
 
     runner.terminate_all()
     started_at = time.monotonic()
-    result = runner.run(task, lambda stage: None)
+    result = runner.run(task, lambda stage: None, threading.Event())
 
     assert time.monotonic() - started_at < 1
     assert result.interrupted is True
@@ -275,7 +286,11 @@ def test_runner_terminates_spawned_process_when_stage_callback_fails(tmp_path: P
     task = task_details(tmp_path, "slow")
     runner = Runner(settings, runner_script=Path(__file__).with_name("fake_runner.py"))
 
-    result = runner.run(task, lambda stage: (_ for _ in ()).throw(RuntimeError("callback failed")))
+    result = runner.run(
+        task,
+        lambda stage: (_ for _ in ()).throw(RuntimeError("callback failed")),
+        threading.Event(),
+    )
 
     assert result.succeeded is False
     assert "callback failed" in (result.error_summary or "")
@@ -405,3 +420,226 @@ def test_scheduler_recovery_marks_old_unfinished_tasks_interrupted(tmp_path: Pat
     assert database.get_task("task-queued")["status"] == "interrupted"  # type: ignore[index]
     assert database.get_task("task-extracting")["status"] == "interrupted"  # type: ignore[index]
     assert database.get_task("task-done")["status"] == "succeeded"  # type: ignore[index]
+
+
+class TargetedBlockingRunner:
+    def __init__(self, blocked_sequences: set[str]) -> None:
+        self.blocked_sequences = blocked_sequences
+        self.lock = threading.Lock()
+        self.started = {
+            sequence: threading.Event() for sequence in blocked_sequences
+        }
+        self.release = {
+            sequence: threading.Event() for sequence in blocked_sequences
+        }
+        self.active_ids: set[str] = set()
+        self.terminated_ids: list[str] = []
+        self.shutdown = threading.Event()
+
+    def run(
+        self,
+        task: dict[str, Any],
+        on_stage: Callable[[str], None],
+        cancel_event: threading.Event,
+    ) -> RunnerResult:
+        task_id = str(task["id"])
+        sequence = str(task["sequence"])
+        with self.lock:
+            self.active_ids.add(task_id)
+        try:
+            on_stage("extracting")
+            if sequence in self.started:
+                self.started[sequence].set()
+                while not self.release[sequence].wait(0.01):
+                    if cancel_event.is_set() or self.shutdown.is_set():
+                        return RunnerResult(
+                            -15,
+                            None,
+                            interrupted=True,
+                            error_summary="task cancellation requested",
+                        )
+            if cancel_event.is_set() or self.shutdown.is_set():
+                return RunnerResult(
+                    -15,
+                    None,
+                    interrupted=True,
+                    error_summary="task cancellation requested",
+                )
+            on_stage("vio")
+            return RunnerResult(0, "SUCCESS")
+        finally:
+            with self.lock:
+                self.active_ids.discard(task_id)
+
+    def terminate_task(self, task_id: str) -> None:
+        self.terminated_ids.append(task_id)
+
+    def terminate_all(self) -> None:
+        self.shutdown.set()
+
+
+class StubbornRunner(TargetedBlockingRunner):
+    def run(
+        self,
+        task: dict[str, Any],
+        on_stage: Callable[[str], None],
+        cancel_event: threading.Event,
+    ) -> RunnerResult:
+        task_id = str(task["id"])
+        sequence = str(task["sequence"])
+        with self.lock:
+            self.active_ids.add(task_id)
+        try:
+            on_stage("extracting")
+            self.started[sequence].set()
+            self.release[sequence].wait(3)
+            return RunnerResult(0, "SUCCESS")
+        finally:
+            with self.lock:
+                self.active_ids.discard(task_id)
+
+
+class NeverExitsProcess:
+    pid = 12345
+
+    def poll(self) -> None:
+        return None
+
+    def wait(self, timeout: float | None = None) -> int:
+        raise subprocess.TimeoutExpired("runner", timeout)
+
+
+def test_runner_skips_launch_when_task_is_already_cancelled(tmp_path: Path) -> None:
+    settings = fake_runner_settings(tmp_path)
+    task = task_details(tmp_path, "slow")
+    runner = Runner(settings, runner_script=Path(__file__).with_name("fake_runner.py"))
+    cancel_event = threading.Event()
+    cancel_event.set()
+
+    result = runner.run(task, lambda stage: None, cancel_event)
+
+    assert result.interrupted is True
+    assert "cancel" in (result.error_summary or "")
+    assert runner.active_count == 0
+    assert not (Path(task["task_root"]) / "output" / "slow" / "child.pid").exists()
+
+
+def test_runner_registration_window_cannot_miss_targeted_cancellation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = fake_runner_settings(tmp_path)
+    task = task_details(tmp_path, "slow")
+    runner = Runner(settings, runner_script=Path(__file__).with_name("fake_runner.py"))
+    cancel_event = threading.Event()
+    popen_started = threading.Event()
+    release_popen = threading.Event()
+    real_popen = runner_module.subprocess.Popen
+
+    def blocking_popen(*args: object, **kwargs: object) -> subprocess.Popen[str]:
+        process = real_popen(*args, **kwargs)
+        popen_started.set()
+        assert release_popen.wait(3)
+        return process
+
+    monkeypatch.setattr(runner_module.subprocess, "Popen", blocking_popen)
+    results: list[RunnerResult] = []
+    errors: list[Exception] = []
+    run_thread = threading.Thread(
+        target=lambda: results.append(runner.run(task, lambda stage: None, cancel_event))
+    )
+    run_thread.start()
+    assert popen_started.wait(3)
+
+    cancel_event.set()
+    cancel_thread = threading.Thread(
+        target=lambda: _capture_error(errors, lambda: runner.terminate_task(str(task["id"])))
+    )
+    cancel_thread.start()
+    time.sleep(0.05)
+    assert cancel_thread.is_alive()
+    release_popen.set()
+    cancel_thread.join(3)
+    run_thread.join(3)
+
+    assert errors == []
+    assert not cancel_thread.is_alive()
+    assert not run_thread.is_alive()
+    assert results[0].interrupted is True
+    assert runner.active_count == 0
+
+
+def test_runner_targeted_termination_raises_when_process_never_exits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = make_settings(tmp_path)
+    object.__setattr__(settings, "terminate_grace_sec", 0.01)
+    runner = Runner(settings)
+    runner._active["task-stuck"] = NeverExitsProcess()  # type: ignore[assignment]
+    monkeypatch.setattr(runner_module.os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(runner_module.os, "killpg", lambda pid, sig: None)
+
+    with pytest.raises(TimeoutError, match="task-stuck.*did not exit"):
+        runner.terminate_task("task-stuck")
+
+
+def test_scheduler_cancel_queued_task_does_not_block_following_task(tmp_path: Path) -> None:
+    database = create_database_with_tasks(tmp_path, ["one", "two", "three"])
+    runner = TargetedBlockingRunner({"one"})
+    scheduler = Scheduler(database, runner, max_concurrency=1)
+    scheduler.start()
+    scheduler.enqueue(["task-one", "task-two", "task-three"])
+    assert runner.started["one"].wait(3)
+
+    scheduler.cancel_and_wait("task-two", 0.5)
+    runner.release["one"].set()
+
+    assert scheduler.wait_until_idle(3)
+    assert database.get_task("task-two")["status"] == "interrupted"  # type: ignore[index]
+    assert database.get_task("task-three")["status"] == "succeeded"  # type: ignore[index]
+    assert runner.terminated_ids == ["task-two"]
+    scheduler.stop()
+
+
+def test_scheduler_targeted_cancel_does_not_interrupt_other_running_task(
+    tmp_path: Path,
+) -> None:
+    database = create_database_with_tasks(tmp_path, ["one", "two"])
+    runner = TargetedBlockingRunner({"one", "two"})
+    scheduler = Scheduler(database, runner, max_concurrency=2)
+    scheduler.start()
+    scheduler.enqueue(["task-one", "task-two"])
+    assert runner.started["one"].wait(3)
+    assert runner.started["two"].wait(3)
+
+    scheduler.cancel_and_wait("task-one", 1)
+
+    assert database.get_task("task-one")["status"] == "interrupted"  # type: ignore[index]
+    assert database.get_task("task-two")["status"] == "extracting"  # type: ignore[index]
+    assert runner.active_ids == {"task-two"}
+    assert scheduler.runtime_summary()["running"] == 1
+    runner.release["two"].set()
+    assert scheduler.wait_until_idle(3)
+    assert database.get_task("task-two")["status"] == "succeeded"  # type: ignore[index]
+    assert runner.active_ids == set()
+    assert scheduler.runtime_summary()["running"] == 0
+    scheduler.stop()
+
+
+def test_scheduler_cancel_and_wait_reports_lifecycle_timeout(tmp_path: Path) -> None:
+    database = create_database_with_tasks(tmp_path, ["one"])
+    runner = StubbornRunner({"one"})
+    scheduler = Scheduler(database, runner, max_concurrency=1)
+    scheduler.start()
+    scheduler.enqueue(["task-one"])
+    assert runner.started["one"].wait(3)
+
+    with pytest.raises(TimeoutError, match="task-one.*did not stop"):
+        scheduler.cancel_and_wait("task-one", 0.05)
+
+    assert database.get_task("task-one")["status"] == "interrupted"  # type: ignore[index]
+    runner.release["one"].set()
+    assert scheduler.wait_until_idle(3)
+    assert scheduler.runtime_summary()["running"] == 0
+    scheduler.stop()

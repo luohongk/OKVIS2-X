@@ -52,6 +52,7 @@ async function apiRequest<T>(
   if (expectedStatus !== undefined && response.status !== expectedStatus) {
     throw new Error(`任务创建需要返回 ${expectedStatus}，实际为 ${response.status}`)
   }
+  if (response.status === 204) return undefined as T
   return (await response.json()) as T
 }
 
@@ -69,6 +70,8 @@ export const taskApi = {
     apiRequest<{ items: Task[] }>(`/api/v1/tasks?${query}`, { signal }),
   runtime: (signal?: AbortSignal) =>
     apiRequest<RuntimeStatus>('/api/v1/runtime', { signal }),
+  remove: (taskId: string) =>
+    apiRequest<void>(`/api/v1/tasks/${encodeURIComponent(taskId)}`, { method: 'DELETE' }),
 }
 
 export const catalogApi = {

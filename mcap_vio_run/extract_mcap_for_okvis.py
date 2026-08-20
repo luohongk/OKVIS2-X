@@ -22,8 +22,10 @@ import argparse
 import csv
 import struct
 import sys
+import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -36,6 +38,57 @@ from rosbags.highlevel import AnyReader
 CAM_NAMES = ("cam0", "cam1", "cam2", "cam3")
 IMU_DIR_NAME = "imu"
 OKVIS_IMU_DIR_NAME = "imu0"
+PROGRESS_UPDATE_EVERY_MESSAGES = 25
+
+
+class CameraProgressReporter:
+    """Emit compact, throttled progress shared by all camera workers."""
+
+    def __init__(self, totals: dict[str, int], interval: float) -> None:
+        self.totals = totals
+        self.interval = interval
+        self.started_at = time.monotonic()
+        self.last_report_at = self.started_at
+        self.processed = {cam: 0 for cam in totals}
+        self.frames = {cam: 0 for cam in totals}
+        self.lock = threading.Lock()
+
+    def update(self, cam_name: str, processed: int, frames: int) -> None:
+        now = time.monotonic()
+        with self.lock:
+            self.processed[cam_name] = processed
+            self.frames[cam_name] = frames
+            if now - self.last_report_at < self.interval:
+                return
+            self.last_report_at = now
+            line = self._format_line(now)
+        print(line, flush=True)
+
+    def report(self) -> None:
+        now = time.monotonic()
+        with self.lock:
+            self.last_report_at = now
+            line = self._format_line(now)
+        print(line, flush=True)
+
+    def _format_line(self, now: float) -> str:
+        processed = sum(
+            min(self.processed[cam], self.totals[cam])
+            for cam in self.totals
+        )
+        total = sum(self.totals.values())
+        frames = sum(self.frames.values())
+        elapsed = max(0.0, now - self.started_at)
+        rate = frames / elapsed if elapsed > 0 else 0.0
+        percent = min(100.0, processed * 100.0 / total) if total else 0.0
+        cameras = " ".join(
+            f"{cam}={min(self.processed[cam], self.totals[cam])}/{self.totals[cam]}"
+            for cam in CAM_NAMES
+        )
+        return (
+            f"[PROGRESS] {percent:5.1f}% messages={processed}/{total} "
+            f"frames={frames} elapsed={elapsed:.1f}s rate={rate:.1f} frame/s | {cameras}"
+        )
 
 
 class CdrReader:
@@ -121,6 +174,21 @@ def open_reader(input_dir: Path) -> AnyReader:
     return reader
 
 
+def camera_message_count(session_dir: Path, cam_name: str) -> int:
+    reader = open_reader(session_dir / cam_name)
+    try:
+        connections = [
+            conn
+            for conn in reader.connections
+            if conn.msgtype == "sensor_msgs/msg/CompressedImage"
+        ]
+        if not connections:
+            raise RuntimeError(f"no CompressedImage topic found in {session_dir / cam_name}")
+        return sum(conn.msgcount for conn in connections)
+    finally:
+        reader.close()
+
+
 def save_frame(frame: av.VideoFrame, timestamp_ns: int, output_dir: Path, size: tuple[int, int]) -> str:
     image = frame.to_ndarray(format="gray")
     if image.shape[1] != size[0] or image.shape[0] != size[1]:
@@ -138,6 +206,7 @@ def extract_camera(
     cam_name: str,
     size: tuple[int, int],
     max_frames: int | None,
+    on_progress: Callable[[str, int, int], None] | None = None,
 ) -> tuple[str, int, int]:
     input_dir = session_dir / cam_name
     output_dir = save_root / cam_name / "data"
@@ -166,6 +235,8 @@ def extract_camera(
             fmt, packet_bytes = parse_compressed_image(raw)
             if "h264" not in fmt:
                 skipped += 1
+                if on_progress is not None:
+                    on_progress(cam_name, message_count, len(rows))
                 continue
 
             pending_timestamps.append(timestamp_ns)
@@ -178,6 +249,15 @@ def extract_camera(
                         break
                 if max_frames is not None and len(rows) >= max_frames:
                     break
+
+            if (
+                on_progress is not None
+                and (
+                    message_count % PROGRESS_UPDATE_EVERY_MESSAGES == 0
+                    or (max_frames is not None and len(rows) >= max_frames)
+                )
+            ):
+                on_progress(cam_name, message_count, len(rows))
 
         if max_frames is None:
             for packet in codec.parse(b""):
@@ -203,6 +283,9 @@ def extract_camera(
         writer.writerow(["#timestamp [ns]", "filename"])
         for ts, filename in rows:
             writer.writerow([str(ts), filename])
+
+    if on_progress is not None:
+        on_progress(cam_name, message_count, len(rows))
 
     return cam_name, len(rows), skipped + len(pending_timestamps)
 
@@ -256,6 +339,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--height", type=int, default=600)
     parser.add_argument("--cam-workers", type=int, default=4)
     parser.add_argument("--max-frames", type=int, default=None, help="debug limit per camera")
+    parser.add_argument(
+        "--progress-interval",
+        type=float,
+        default=5.0,
+        help="seconds between camera extraction progress lines",
+    )
     return parser.parse_args()
 
 
@@ -273,6 +362,9 @@ def main() -> int:
     if missing:
         print(f"[ERROR] missing input directories: {', '.join(missing)}", file=sys.stderr)
         return 1
+    if args.progress_interval <= 0:
+        print("[ERROR] --progress-interval must be greater than zero", file=sys.stderr)
+        return 1
 
     print("=" * 70)
     print("  MCAP -> EuRoC extractor for OKVIS")
@@ -285,17 +377,46 @@ def main() -> int:
     start_time = time.time()
 
     imu_count = extract_imu(session_dir, save_root)
-    print(f"[imu0] {imu_count} rows")
+    print(f"[imu0] {imu_count} rows", flush=True)
 
     workers = max(1, min(args.cam_workers, len(CAM_NAMES)))
+    camera_totals = {
+        cam: camera_message_count(session_dir, cam)
+        for cam in CAM_NAMES
+    }
+    if args.max_frames is not None:
+        camera_totals = {
+            cam: min(total, args.max_frames)
+            for cam, total in camera_totals.items()
+        }
+    print(
+        "[CAMERAS] "
+        + " ".join(f"{cam}={camera_totals[cam]}" for cam in CAM_NAMES)
+        + f" total={sum(camera_totals.values())} workers={workers}",
+        flush=True,
+    )
+    progress = CameraProgressReporter(camera_totals, args.progress_interval)
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = [
-            executor.submit(extract_camera, session_dir, save_root, cam, size, args.max_frames)
+            executor.submit(
+                extract_camera,
+                session_dir,
+                save_root,
+                cam,
+                size,
+                args.max_frames,
+                progress.update,
+            )
             for cam in CAM_NAMES
         ]
         for future in as_completed(futures):
             cam_name, frame_count, skipped = future.result()
-            print(f"[{cam_name}] {frame_count} frames, skipped_or_pending={skipped}")
+            print(
+                f"[{cam_name}] {frame_count} frames, skipped_or_pending={skipped}",
+                flush=True,
+            )
+
+    progress.report()
 
     elapsed = time.time() - start_time
     print("=" * 70)

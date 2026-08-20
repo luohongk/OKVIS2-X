@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import shutil
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,6 +19,10 @@ from .settings import Settings
 class CreatedTaskGroup:
     group_id: str
     task_ids: list[str]
+
+
+class UnsafeTaskRootError(ValueError):
+    pass
 
 
 def _new_id() -> str:
@@ -122,6 +127,36 @@ class TaskService:
             raise
 
         return CreatedTaskGroup(group_id=group_id, task_ids=task_ids)
+
+    def delete_task(self, task: Mapping[str, object]) -> bool:
+        task_id = str(task["id"])
+        task_root = self._validated_task_root(task_id, Path(str(task["task_root"])))
+        if task_root.exists():
+            shutil.rmtree(task_root)
+        return self.database.delete_task(task_id)
+
+    def _validated_task_root(self, task_id: str, task_root: Path) -> Path:
+        runtime_root = Path(os.path.abspath(self.settings.runtime_root))
+        tasks_root = Path(os.path.abspath(runtime_root / "tasks"))
+        normalized_task_root = Path(os.path.abspath(task_root))
+
+        if runtime_root.is_symlink() or tasks_root.is_symlink():
+            raise UnsafeTaskRootError("runtime and tasks roots cannot be symbolic links")
+        try:
+            relative_task_root = normalized_task_root.relative_to(tasks_root)
+        except ValueError as exc:
+            raise UnsafeTaskRootError("task root is outside tasks root") from exc
+        if not relative_task_root.parts:
+            raise UnsafeTaskRootError("task root must be a strict descendant of tasks root")
+        if normalized_task_root.name != task_id:
+            raise UnsafeTaskRootError("task root basename must match task id")
+
+        current = tasks_root
+        for component in relative_task_root.parts:
+            current /= component
+            if current.is_symlink():
+                raise UnsafeTaskRootError("task path cannot contain a symbolic link")
+        return normalized_task_root
 
     def _prepare_task_parent(
         self,

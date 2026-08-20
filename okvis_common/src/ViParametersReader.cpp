@@ -315,20 +315,28 @@ void ViParametersReader::readConfigFile(const std::string& filename) {
              viParameters_.frontend.num_matching_threads);
 
   // Deep-learning feature parameters (optional – defaults set in struct)
-  parseEntry(file["frontend_parameters"], "use_dl_features",
-             viParameters_.frontend.use_dl_features);
-  parseEntry(file["frontend_parameters"], "dl_extractor_type",
-             viParameters_.frontend.dl_extractor_type);
-  parseEntry(file["frontend_parameters"], "dl_extractor_path",
-             viParameters_.frontend.dl_extractor_path);
-  parseEntry(file["frontend_parameters"], "dl_matcher_path",
-             viParameters_.frontend.dl_matcher_path);
-  parseEntry(file["frontend_parameters"], "dl_match_threshold",
-             viParameters_.frontend.dl_match_threshold);
-  parseEntry(file["frontend_parameters"], "dl_image_size",
-             viParameters_.frontend.dl_image_size);
-  parseEntry(file["frontend_parameters"], "dl_use_gpu",
-             viParameters_.frontend.dl_use_gpu);
+  const cv::FileNode frontendParameters = file["frontend_parameters"];
+  if (!frontendParameters["use_dl_features"].empty())
+    parseEntry(frontendParameters, "use_dl_features",
+               viParameters_.frontend.use_dl_features);
+  if (!frontendParameters["dl_extractor_type"].empty())
+    parseEntry(frontendParameters, "dl_extractor_type",
+               viParameters_.frontend.dl_extractor_type);
+  if (!frontendParameters["dl_extractor_path"].empty())
+    parseEntry(frontendParameters, "dl_extractor_path",
+               viParameters_.frontend.dl_extractor_path);
+  if (!frontendParameters["dl_matcher_path"].empty())
+    parseEntry(frontendParameters, "dl_matcher_path",
+               viParameters_.frontend.dl_matcher_path);
+  if (!frontendParameters["dl_match_threshold"].empty())
+    parseEntry(frontendParameters, "dl_match_threshold",
+               viParameters_.frontend.dl_match_threshold);
+  if (!frontendParameters["dl_image_size"].empty())
+    parseEntry(frontendParameters, "dl_image_size",
+               viParameters_.frontend.dl_image_size);
+  if (!frontendParameters["dl_use_gpu"].empty())
+    parseEntry(frontendParameters, "dl_use_gpu",
+               viParameters_.frontend.dl_use_gpu);
 
   // Parameters regarding the estimator.
   parseEntry(file["estimator_parameters"], "num_keyframes",

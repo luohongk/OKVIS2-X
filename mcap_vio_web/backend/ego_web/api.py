@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Header, HTTPException, Query, Request, status
+from fastapi import APIRouter, Header, HTTPException, Query, Request, Response, status
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -19,6 +19,7 @@ from .results import (
     resolve_artifact,
     trajectory_path,
 )
+from .task_service import UnsafeTaskRootError
 
 
 class TaskOptionsRequest(BaseModel):
@@ -198,6 +199,22 @@ def task(task_id: str, request: Request) -> dict[str, object]:
     if item is None:
         raise HTTPException(status_code=404, detail="task not found")
     return _public_task(item)
+
+
+@router.delete("/tasks/{task_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_task(task_id: str, request: Request) -> Response:
+    settings, database, service, scheduler = _components(request)
+    task = database.get_task_details(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    try:
+        scheduler.cancel_and_wait(task_id, settings.terminate_grace_sec)
+        service.delete_task(task)
+    except UnsafeTaskRootError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (TimeoutError, OSError, sqlite3.Error) as exc:
+        raise HTTPException(status_code=503, detail="task deletion is unavailable") from exc
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get("/tasks/{task_id}/events")

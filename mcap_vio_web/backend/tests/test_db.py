@@ -126,6 +126,68 @@ def test_create_group_rolls_back_everything_when_a_task_is_invalid(tmp_path: Pat
     assert db.list_tasks(group_id="group-1") == []
 
 
+def test_delete_task_keeps_group_when_sibling_remains(tmp_path: Path) -> None:
+    db = Database(tmp_path / "platform.sqlite3")
+    db.initialize()
+    db.create_task_group(
+        group_record(),
+        [task_record("task-1", "seq-1"), task_record("task-2", "seq-2")],
+    )
+
+    assert db.delete_task("task-1") is True
+
+    assert db.get_task("task-1") is None
+    assert db.get_task("task-2") is not None
+    group = db.get_task_group("group-1")
+    assert group is not None
+    assert group["task_count"] == 1
+
+
+def test_delete_task_removes_group_when_last_task_is_deleted(tmp_path: Path) -> None:
+    db = Database(tmp_path / "platform.sqlite3")
+    db.initialize()
+    db.create_task_group(group_record(), [task_record("task-1", "seq-1")])
+
+    assert db.delete_task("task-1") is True
+
+    assert db.get_task("task-1") is None
+    assert db.get_task_group("group-1") is None
+
+
+def test_delete_task_returns_false_when_task_does_not_exist(tmp_path: Path) -> None:
+    db = Database(tmp_path / "platform.sqlite3")
+    db.initialize()
+    db.create_task_group(group_record(), [task_record("task-1", "seq-1")])
+
+    assert db.delete_task("missing") is False
+
+    assert db.get_task("task-1") is not None
+    assert db.get_task_group("group-1") is not None
+
+
+def test_delete_task_rolls_back_task_delete_when_group_cleanup_fails(tmp_path: Path) -> None:
+    db = Database(tmp_path / "platform.sqlite3")
+    db.initialize()
+    db.create_task_group(group_record(), [task_record("task-1", "seq-1")])
+    with db.connect() as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER reject_group_delete
+            BEFORE DELETE ON task_groups
+            BEGIN
+                SELECT RAISE(ABORT, 'group delete rejected');
+            END
+            """
+        )
+        connection.commit()
+
+    with pytest.raises(sqlite3.IntegrityError, match="group delete rejected"):
+        db.delete_task("task-1")
+
+    assert db.get_task("task-1") is not None
+    assert db.get_task_group("group-1") is not None
+
+
 def test_transition_task_enforces_state_machine_and_records_result(tmp_path: Path) -> None:
     db = Database(tmp_path / "platform.sqlite3")
     db.initialize()

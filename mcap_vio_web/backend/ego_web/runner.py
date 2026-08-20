@@ -65,7 +65,7 @@ class Runner:
         self.runner_script = runner_script
         self._lock = threading.Lock()
         self._active: dict[str, subprocess.Popen[str]] = {}
-        self._interrupted: set[str] = set()
+        self._interrupted: dict[str, str] = {}
         self._terminating = False
 
     @property
@@ -77,6 +77,7 @@ class Runner:
         self,
         task: Mapping[str, Any],
         on_stage: Callable[[str], None],
+        cancel_event: threading.Event,
     ) -> RunnerResult:
         task_id = str(task["id"])
         task_root = Path(task["task_root"])
@@ -95,12 +96,16 @@ class Runner:
         try:
             with log_path.open("w", encoding="utf-8") as log_file:
                 with self._lock:
-                    if self._terminating:
+                    if self._terminating or cancel_event.is_set():
                         return RunnerResult(
                             exit_code=-15,
                             runner_status=None,
                             interrupted=True,
-                            error_summary="runner is shutting down",
+                            error_summary=(
+                                "runner is shutting down"
+                                if self._terminating
+                                else "task cancellation requested"
+                            ),
                         )
                     process = subprocess.Popen(
                         command,
@@ -136,8 +141,8 @@ class Runner:
         finally:
             with self._lock:
                 self._active.pop(task_id, None)
-                interrupted = task_id in self._interrupted
-                self._interrupted.discard(task_id)
+                interruption_summary = self._interrupted.pop(task_id, None)
+                interrupted = interruption_summary is not None
 
         status_path = task_root / "output" / str(task["sequence"]) / "status.txt"
         runner_status: str | None = None
@@ -146,7 +151,7 @@ class Runner:
 
         error_summary: str | None = execution_error
         if interrupted:
-            error_summary = "task interrupted during shutdown"
+            error_summary = interruption_summary
         elif error_summary is None and exit_code != 0:
             error_summary = recent_lines[-1] if recent_lines else f"runner exited with code {exit_code}"
         elif error_summary is None and runner_status != "SUCCESS":
@@ -159,33 +164,52 @@ class Runner:
             error_summary=error_summary,
         )
 
-    def _terminate_process(self, process: subprocess.Popen[str]) -> None:
+    def _terminate_process(
+        self,
+        process: subprocess.Popen[str],
+        *,
+        task_id: str | None = None,
+    ) -> None:
         if process.poll() is not None:
             return
+        process_group: int | None = None
         try:
             process_group = os.getpgid(process.pid)
             os.killpg(process_group, signal.SIGTERM)
         except (ProcessLookupError, PermissionError):
-            return
+            pass
         try:
             process.wait(timeout=self.settings.terminate_grace_sec)
             return
         except subprocess.TimeoutExpired:
             pass
-        try:
-            os.killpg(process_group, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
+        if process_group is not None:
+            try:
+                os.killpg(process_group, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
         try:
             process.wait(timeout=self.settings.terminate_grace_sec)
-        except subprocess.TimeoutExpired:
-            pass
+        except subprocess.TimeoutExpired as exc:
+            target = task_id or str(process.pid)
+            raise TimeoutError(
+                f"task {target} process group did not exit after SIGKILL"
+            ) from exc
+
+    def terminate_task(self, task_id: str) -> None:
+        with self._lock:
+            process = self._active.get(task_id)
+            if process is None:
+                return
+            self._interrupted[task_id] = "task cancellation requested"
+        self._terminate_process(process, task_id=task_id)
 
     def terminate_all(self) -> None:
         with self._lock:
             self._terminating = True
             active = list(self._active.items())
-            self._interrupted.update(task_id for task_id, _ in active)
+            for task_id, _ in active:
+                self._interrupted[task_id] = "task interrupted during shutdown"
 
         process_groups: list[int] = []
         for _, process in active:
