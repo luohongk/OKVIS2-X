@@ -785,6 +785,21 @@ bool Frontend::verifyRecognisedPlace(const Estimator &estimator,
                                        extrinsics[camIdx]->parameters());
           break;
         }
+        case okvis::cameras::NCameraSystem::NoDistortion: {
+          std::shared_ptr<ceres::ReprojectionError<cameras::EucmCamera>>
+            reprojectionError(new ceres::ReprojectionError<cameras::EucmCamera>(
+              framesInOut->geometryAs<cameras::EucmCamera>(camIdx),
+              camIdx,
+              kp,
+              64.0 / (size * size) * Eigen::Matrix2d::Identity()));
+          reprojectionErrors.push_back(reprojectionError);
+          quickSolver.AddResidualBlock(reprojectionError.get(),
+                                       &cauchyLoss,
+                                       pose->parameters(),
+                                       landmark->parameters(),
+                                       extrinsics[camIdx]->parameters());
+          break;
+        }
         default:
           OKVIS_THROW(Exception, "Unsupported distortion type.")
           break;
@@ -1326,6 +1341,10 @@ bool Frontend::dataAssociationAndInitialization(
       estimator, params.nCameraSystem, framesInOut);
     break;
   }
+  case okvis::cameras::NCameraSystem::NoDistortion: {
+    removeOutliers<cameras::EucmCamera>(estimator, params.nCameraSystem, framesInOut);
+    break;
+  }
   default:
     OKVIS_THROW(Exception, "Unsupported distortion type.")
     break;
@@ -1349,10 +1368,14 @@ bool Frontend::dataAssociationAndInitialization(
       estimator, params.nCameraSystem, framesInOut);
     break;
   }
+  case okvis::cameras::NCameraSystem::NoDistortion: {
+    removeOutliers<cameras::EucmCamera>(estimator, params.nCameraSystem, framesInOut);
+    break;
+  }
   default:
     OKVIS_THROW(Exception, "Unsupported distortion type.")
     break;
-  } //ToDo:EUCM
+  }
 
 #ifdef OKVIS_USE_NN
   if(params.frontend.use_cnn) {

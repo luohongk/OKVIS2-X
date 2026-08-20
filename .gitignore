@@ -5,3 +5,19 @@
 *.png
 *.asv
 /documentation
+
+# Local and generated files
+/.claude/
+/fishros
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+*.tsbuildinfo
+/mcap_vio_web/backend/.venv/
+/mcap_vio_web/backend/.deps/
+/mcap_vio_web/.node/
+/mcap_vio_web/frontend/node_modules/
+/mcap_vio_web/frontend/dist/
+/mcap_vio_web/frontend/vite.config.js
+/mcap_vio_web/frontend/vite.config.d.ts
+/output/ego_annotation/

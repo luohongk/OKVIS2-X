@@ -217,7 +217,7 @@ struct ImageIterators {
   std::vector<std::vector<std::pair<std::string, std::string>>::iterator> cam_ends;
   /// \brief Depth camera iterator ends.
   std::map<size_t, std::vector<std::pair<std::string, std::string>>::iterator> depthCam_ends;
-  const uint64_t tolNSec = 10000000; ///< Sync time tolerance in nano-seconds.
+  const uint64_t tolNSec = 20000000; ///< Sync time tolerance in nano-seconds.
 
   /// \brief Arg min of the timestamps in current iterators.
   /// @param[out] timestamp The smallest timestamp in current iterators.

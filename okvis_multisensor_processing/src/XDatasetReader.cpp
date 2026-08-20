@@ -281,7 +281,7 @@ void  XDatasetReader::processing() {
   std::vector < std::pair<std::string, std::string> > ::iterator depth_iterators;
   depth_iterators = allDepthNames_.begin();
 
-  const uint64_t tolNSec = 10000000; // 0.01 sec
+  const uint64_t tolNSec = 20000000; // 0.01 sec
   while (streaming_) {
 
     // sync and check if at the end
