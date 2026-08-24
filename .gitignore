@@ -21,3 +21,6 @@
 /mcap_vio_web/frontend/vite.config.js
 /mcap_vio_web/frontend/vite.config.d.ts
 /output/ego_annotation/
+output
+data
+/Miniconda3-latest-Linux-x86_64.sh
