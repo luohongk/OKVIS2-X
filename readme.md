@@ -29,7 +29,7 @@
 
 ## 1. 项目概览
 
-本项目以 [ethz-mrl/OKVIS2-X](https://github.com/ethz-mrl/OKVIS2-X) 为基础，针对 EGO 设备采集数据增加了完整的离线 VIO 流水线和 Web 操作平台。
+以 [ethz-mrl/OKVIS2-X](https://github.com/ethz-mrl/OKVIS2-X) 为基础，针对 EGO 设备采集数据增加了完整的离线 VIO 流水线和 Web 操作平台。
 
 当前主要处理链路如下：
 
